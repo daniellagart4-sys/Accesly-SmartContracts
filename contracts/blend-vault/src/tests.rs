@@ -5,7 +5,7 @@ use soroban_sdk::{
     testutils::{Address as _, StellarAssetContract},
     token::StellarAssetClient,
     Address, Env, Map, String,
-};
+}
 
 use crate::{
     blend_client::{BlendPositions, BlendReserveData, BlendRequest, SCALAR_7},
@@ -223,13 +223,16 @@ fn b_tokens_to_usdc_math() {
     assert_eq!(crate::blend_client::b_tokens_to_usdc(1000, SCALAR_7), 1000);
     // 1000 bTokens * (SCALAR_7 * 2) / SCALAR_7 = 2000
     assert_eq!(crate::blend_client::b_tokens_to_usdc(1000, SCALAR_7 * 2), 2000);
-    // overflow en checked_mul → unwrap_or(i128::MAX) → i128::MAX / SCALAR_7
-    assert_eq!(
-        crate::blend_client::b_tokens_to_usdc(i128::MAX, i128::MAX),
-        i128::MAX / SCALAR_7
-    );
     // cero tokens → cero
     assert_eq!(crate::blend_client::b_tokens_to_usdc(0, SCALAR_7), 0);
+}
+
+#[test]
+#[should_panic(expected = "bToken valuation overflow")]
+fn b_tokens_to_usdc_overflow_panics() {
+    // Overflow must panic (fail closed) instead of silently returning MAX,
+    // which would corrupt share pricing and total_assets().
+    crate::blend_client::b_tokens_to_usdc(i128::MAX, i128::MAX);
 }
 
 #[test]

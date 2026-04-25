@@ -1,23 +1,32 @@
-//! # Blend Protocol Client (Testnet)
+//! # Blend Protocol Client
 //!
 //! Wrapper de cross-contract calls al Pool de Blend v2.
 //!
-//! ⚠️ TESTNET NOTE:
-//!   Los tipos `BlendPositions` y `BlendReserveData` deben coincidir
-//!   EXACTAMENTE con los structs del contrato Pool de Blend desplegado
-//!   en testnet (orden de campos incluido). Verificar contra:
-//!   https://github.com/blend-capital/blend-contracts-v2
+//! Structs verificados contra blend-contracts-v2 (user.rs, storage.rs):
+//!   - `BlendPositions` coincide exactamente con `Positions` de Blend v2.
+//!   - `BlendReserveData` coincide en nombres y tipos con `ReserveData` de Blend v2.
+//!     (Soroban serializa contracttype structs como XDR maps por clave — el orden
+//!      de campos en Rust no afecta la deserialización.)
 //!
-//! RequestType constants (Blend v2):
-//!   0 = SupplyCollateral
-//!   1 = WithdrawCollateral
+//! RequestType constants (Blend v2 — pool/src/pool/actions.rs):
+//!   0 = Supply             (no colateral)
+//!   1 = Withdraw           (no colateral)
+//!   2 = SupplyCollateral   ← el vault usa este
+//!   3 = WithdrawCollateral ← el vault usa este
+//!   4 = Borrow
+//!   5 = Repay
+//!
+//! Direcciones USDC (Circle SAC, SEP-41):
+//!   Mainnet : CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75
+//!   Testnet : el pool Blend TestnetV2 usa CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU
+//!             (para testnet con Circle USDC se requiere desplegar un pool propio)
 //!
 //! SCALAR_7 = 10^7 — factor de escala de b_rate de Blend.
 //!   USDC_value = b_tokens * b_rate / SCALAR_7
 use soroban_sdk::{contracttype, Address, Env, IntoVal, Map, Symbol, Vec};
 
-pub const REQUEST_SUPPLY_COLLATERAL: u32 = 0;
-pub const REQUEST_WITHDRAW_COLLATERAL: u32 = 1;
+pub const REQUEST_SUPPLY_COLLATERAL: u32 = 2;
+pub const REQUEST_WITHDRAW_COLLATERAL: u32 = 3;
 pub const SCALAR_7: i128 = 10_000_000;
 
 // ── Tipos que deben coincidir con Blend v2 ────────────────────────────────────
@@ -143,9 +152,11 @@ pub fn get_b_rate(e: &Env, pool: &Address, usdc: &Address) -> i128 {
 
 /// Calcula el valor en USDC de los bTokens del vault.
 pub fn b_tokens_to_usdc(b_tokens: i128, b_rate: i128) -> i128 {
+    // Fail closed on overflow — silently returning i128::MAX would break
+    // share pricing and total_assets(), potentially allowing deposit/withdraw exploits.
     b_tokens
         .checked_mul(b_rate)
-        .unwrap_or(i128::MAX)
+        .expect("bToken valuation overflow: b_tokens * b_rate")
         .checked_div(SCALAR_7)
         .unwrap_or(0)
 }

@@ -14,7 +14,10 @@
 //! - "session-key" (Default): External signer (session ed25519) + session_key_policy
 //! - "allowlist-tx" (CallContract(target)): External signer (session key) sin policy
 //!
-//! Regla de upgrade y Regla de Blend se añaden en Fase 2 / 11.
+//!
+//! Reglas dinámicas instaladas por el SDK (via admin-cfg):
+//! - "blend-rule" (Default): session key + blend_rule_policy (restrict pool + request types + max amount)
+//! - "upgrade-rule" (Default): session key + upgrade_rule_policy (solo `upgrade` en target_contract)
 use soroban_sdk::{Address, Bytes, BytesN, Env, Map, String, Val, Vec};
 use stellar_accounts::smart_account::{
     self as smart_account_lib, ContextRuleType, Signer,
@@ -127,8 +130,8 @@ pub fn setup_context_rules(
     }
 
     // ── Regla 4: yield-auto ───────────────────────────────────────────────────
-    // Distribución automática de yield CETES. Sin firma del usuario (regla 5).
-    // Solo autoriza llamadas al contrato CETES con la función harvest.
+    // Distribución automática de yield CETES. Sin firma del usuario (relayer Lambda).
+    // Solo autoriza transfer() SEP-41 sobre el contrato CETES (yield-distribution policy).
     {
         let signers: Vec<Signer> = Vec::new(e);
         let mut policies: Map<Address, Val> = Map::new(e);

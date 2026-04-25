@@ -42,6 +42,8 @@ pub enum SessionKeyError {
     AmountExceeded = 5002,
     /// Ya existe una sesión para esta context rule.
     AlreadyInstalled = 5003,
+    /// Llamada no-transfer rechazada cuando hay límite de monto activo.
+    NonTransferNotAllowed = 5004,
 }
 
 // ── Storage ──────────────────────────────────────────────────────────────────
@@ -146,15 +148,23 @@ impl Policy for SessionKeyPolicy {
         }
 
         // 2. Si hay límite de monto, verificar y acumular
+        // When max_amount > 0, only transfer() is allowed to prevent approve/allowance bypass.
         if data.max_amount > 0 {
-            if let Some(amount) = extract_transfer_amount(e, &context) {
-                let new_spent = data.spent.checked_add(amount)
-                    .unwrap_or(i128::MAX);
-                if new_spent > data.max_amount {
-                    panic_with_error!(e, SessionKeyError::AmountExceeded);
+            match extract_transfer_amount(e, &context) {
+                Some(amount) => {
+                    let new_spent = data.spent.checked_add(amount)
+                        .unwrap_or_else(|| panic_with_error!(e, SessionKeyError::AmountExceeded));
+                    if new_spent > data.max_amount {
+                        panic_with_error!(e, SessionKeyError::AmountExceeded);
+                    }
+                    data.spent = new_spent;
+                    save_session(e, &smart_account, context_rule.id, &data);
                 }
-                data.spent = new_spent;
-                save_session(e, &smart_account, context_rule.id, &data);
+                None => {
+                    // Reject approve/allowance and any non-transfer call to prevent
+                    // unlimited drain via spending cap bypass.
+                    panic_with_error!(e, SessionKeyError::NonTransferNotAllowed);
+                }
             }
         }
     }
@@ -166,6 +176,7 @@ impl Policy for SessionKeyPolicy {
         context_rule: ContextRule,
         smart_account: Address,
     ) {
+        smart_account.require_auth();
         let key = storage_key(&smart_account, context_rule.id);
         if e.storage().persistent().has(&key) {
             panic_with_error!(e, SessionKeyError::AlreadyInstalled);
@@ -180,6 +191,7 @@ impl Policy for SessionKeyPolicy {
 
     /// Elimina los datos de la sesión.
     fn uninstall(e: &Env, context_rule: ContextRule, smart_account: Address) {
+        smart_account.require_auth();
         let key = storage_key(&smart_account, context_rule.id);
         if !e.storage().persistent().has(&key) {
             panic_with_error!(e, SessionKeyError::NotInstalled);
@@ -298,11 +310,16 @@ mod tests {
         let addr = e.register(MockContract, ());
         let account = Address::generate(&e);
         let rule = make_rule(&e);
-        e.mock_all_auths();
 
+        e.mock_all_auths();
         e.as_contract(&addr, || {
             let params = SessionKeyInstallParams { expires_at: 1000, max_amount: 0 };
-            SessionKeyPolicy::install(&e, params.clone(), rule.clone(), account.clone());
+            SessionKeyPolicy::install(&e, params, rule.clone(), account.clone());
+        });
+
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
+            let params = SessionKeyInstallParams { expires_at: 1000, max_amount: 0 };
             SessionKeyPolicy::install(&e, params, rule.clone(), account.clone());
         });
     }
@@ -315,13 +332,16 @@ mod tests {
         let addr = e.register(MockContract, ());
         let account = Address::generate(&e);
         let rule = make_rule(&e);
-        e.mock_all_auths();
 
+        e.mock_all_auths();
         e.as_contract(&addr, || {
             let params = SessionKeyInstallParams { expires_at: 1000, max_amount: 0 };
             SessionKeyPolicy::install(&e, params, rule.clone(), account.clone());
+        });
+
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
             SessionKeyPolicy::uninstall(&e, rule.clone(), account.clone());
-            // is_active debe devolver false después de uninstall
             assert!(!SessionKeyPolicy::is_active(e.clone(), rule.id, account.clone()));
         });
     }
@@ -385,13 +405,17 @@ mod tests {
         let addr = e.register(MockContract, ());
         let account = Address::generate(&e);
         let rule = make_rule(&e);
-        e.mock_all_auths();
         e.ledger().with_mut(|l| l.sequence_number = 100);
 
+        e.mock_all_auths();
         e.as_contract(&addr, || {
             let params = SessionKeyInstallParams { expires_at: 1000, max_amount: 0 };
             SessionKeyPolicy::install(&e, params, rule.clone(), account.clone());
             assert!(SessionKeyPolicy::is_active(e.clone(), rule.id, account.clone()));
+        });
+
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
             SessionKeyPolicy::revoke(e.clone(), rule.id, account.clone());
             assert!(!SessionKeyPolicy::is_active(e.clone(), rule.id, account.clone()));
         });
@@ -486,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn enforce_non_transfer_context_no_limit_passes() {
+    fn enforce_non_transfer_no_limit_passes() {
         let e = Env::default();
         let addr = e.register(MockContract, ());
         let account = Address::generate(&e);
@@ -497,7 +521,27 @@ mod tests {
         e.as_contract(&addr, || {
             let params = SessionKeyInstallParams { expires_at: 500, max_amount: 0 };
             SessionKeyPolicy::install(&e, params, rule.clone(), account.clone());
-            // Contexto que no es transfer — con max_amount=0 pasa igual
+            // Without a spending cap, non-transfer calls are allowed.
+            SessionKeyPolicy::enforce(
+                &e, non_transfer_ctx(&e), Vec::new(&e), rule.clone(), account.clone(),
+            );
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5004)")]
+    fn enforce_non_transfer_with_limit_rejected() {
+        let e = Env::default();
+        let addr = e.register(MockContract, ());
+        let account = Address::generate(&e);
+        let rule = make_rule(&e);
+        e.mock_all_auths();
+        e.ledger().with_mut(|l| l.sequence_number = 100);
+
+        e.as_contract(&addr, || {
+            let params = SessionKeyInstallParams { expires_at: 500, max_amount: 100_000 };
+            SessionKeyPolicy::install(&e, params, rule.clone(), account.clone());
+            // approve() with a spending cap must be rejected to prevent allowance bypass.
             SessionKeyPolicy::enforce(
                 &e, non_transfer_ctx(&e), Vec::new(&e), rule.clone(), account.clone(),
             );

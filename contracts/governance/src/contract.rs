@@ -25,8 +25,9 @@ use stellar_access::access_control::{
     ensure_role, get_role_member_count, grant_role_no_auth, set_admin, AccessControl,
 };
 use stellar_governance::timelock::{
-    cancel_operation, execute_operation, schedule_operation, set_execute_operation,
-    set_min_delay as timelock_set_min_delay, Operation, OperationState, TimelockError, Timelock,
+    cancel_operation, execute_operation, get_operation_state, hash_operation, schedule_operation,
+    set_execute_operation, set_min_delay as timelock_set_min_delay, Operation, OperationState,
+    TimelockError, Timelock,
 };
 use stellar_macros::{only_admin, only_role};
 
@@ -45,6 +46,8 @@ const CANCELLER_ROLE: Symbol = symbol_short!("canceller");
 #[repr(u32)]
 enum ControllerError {
     LengthMismatch = 0,
+    /// Self-admin without executors leaves governance completely unprotected.
+    NoSelfAdminWithoutExecutors = 1,
 }
 
 // ── Metadata de operación (para self-admin via CustomAccountInterface) ────────
@@ -77,6 +80,10 @@ impl TimelockController {
         executors: Vec<Address>,
         admin: Option<Address>,
     ) {
+        // Self-admin with zero executors leaves governance permissionless.
+        if admin.is_none() && executors.is_empty() {
+            panic_with_error!(e, ControllerError::NoSelfAdminWithoutExecutors);
+        }
         let admin_addr = admin.unwrap_or_else(|| e.current_contract_address());
         set_admin(e, &admin_addr);
 
@@ -116,20 +123,23 @@ impl CustomAccountInterface for TimelockController {
                         panic_with_error!(&e, TimelockError::Unauthorized)
                     }
 
-                    if get_role_member_count(&e, &EXECUTOR_ROLE) != 0 {
-                        let args_for_auth = (
-                            Symbol::new(&e, "execute_op"),
-                            contract.clone(),
-                            fn_name.clone(),
-                            args.clone(),
-                            meta.predecessor.clone(),
-                            meta.salt.clone(),
-                        ).into_val(&e);
+                    // Always require executor auth — bypassing when executor set is
+                    // empty allows any caller to satisfy self-admin auth with no signature.
+                    let args_for_auth = (
+                        Symbol::new(&e, "execute_op"),
+                        contract.clone(),
+                        fn_name.clone(),
+                        args.clone(),
+                        meta.predecessor.clone(),
+                        meta.salt.clone(),
+                    ).into_val(&e);
 
-                        let executor = meta.executor.expect("executor must be present");
-                        ensure_role(&e, &EXECUTOR_ROLE, &executor);
-                        executor.require_auth_for_args(args_for_auth);
-                    }
+                    let executor = match meta.executor {
+                        Some(e) => e,
+                        None => panic_with_error!(&e, TimelockError::Unauthorized),
+                    };
+                    ensure_role(&e, &EXECUTOR_ROLE, &executor);
+                    executor.require_auth_for_args(args_for_auth);
 
                     let op = Operation {
                         target: contract,
@@ -138,6 +148,14 @@ impl CustomAccountInterface for TimelockController {
                         predecessor: meta.predecessor,
                         salt: meta.salt,
                     };
+                    // Reject any attempt to authorize without having passed through
+                    // schedule() → 48h wait → execute(). Prevents an executor from
+                    // directly calling admin functions (e.g. update_delay) by
+                    // satisfying __check_auth without a prior scheduled operation.
+                    let op_id = hash_operation(&e, &op);
+                    if get_operation_state(&e, &op_id) != OperationState::Ready {
+                        panic_with_error!(&e, TimelockError::Unauthorized);
+                    }
                     set_execute_operation(&e, &op);
                 }
                 _ => panic_with_error!(&e, TimelockError::Unauthorized),
@@ -176,8 +194,13 @@ impl Timelock for TimelockController {
         salt: BytesN<32>,
         executor: Option<Address>,
     ) -> Val {
+        // Always enforce executor role when the role set is non-empty.
+        // Empty executor set is only allowed if an external admin was set at deploy.
         if get_role_member_count(e, &EXECUTOR_ROLE) != 0 {
-            let executor = executor.expect("executor must be present");
+            let executor = match executor {
+                Some(e) => e,
+                None => panic_with_error!(e, TimelockError::Unauthorized),
+            };
             ensure_role(e, &EXECUTOR_ROLE, &executor);
             executor.require_auth();
         }
@@ -212,7 +235,9 @@ mod tests {
         testutils::{Address as _, Ledger},
         Address, BytesN, Env, IntoVal, Symbol, Vec,
     };
-    use stellar_governance::timelock::{get_min_delay, get_operation_state, OperationState};
+    use stellar_governance::timelock::{
+        get_min_delay, get_operation_state, hash_operation, set_execute_operation, OperationState,
+    };
 
     use super::*;
 
@@ -365,6 +390,51 @@ mod tests {
 
         e.as_contract(&addr, || {
             assert_eq!(get_operation_state(&e, &op_id), OperationState::Unset);
+        });
+    }
+
+    // ── check_auth rejects unscheduled operation ──────────────────────────────
+
+    #[test]
+    #[should_panic]
+    fn check_auth_rejects_unscheduled_operation() {
+        let e = Env::default();
+        let (addr, _, _) = deploy(&e);
+        let target = e.register(TargetContract, ());
+
+        // Operation that was never scheduled (state = Unset, not Ready)
+        let op = Operation {
+            target,
+            function: Symbol::new(&e, "ping"),
+            args: Vec::new(&e),
+            predecessor: empty(&e),
+            salt: empty(&e),
+        };
+
+        // Calling set_execute_operation on an unscheduled op must panic —
+        // the same invariant __check_auth now enforces explicitly.
+        e.as_contract(&addr, || {
+            set_execute_operation(&e, &op);
+        });
+    }
+
+    #[test]
+    fn unscheduled_operation_is_not_ready() {
+        let e = Env::default();
+        let (addr, _, _) = deploy(&e);
+        let target = e.register(TargetContract, ());
+
+        let op = Operation {
+            target,
+            function: Symbol::new(&e, "ping"),
+            args: Vec::new(&e),
+            predecessor: empty(&e),
+            salt: empty(&e),
+        };
+
+        e.as_contract(&addr, || {
+            let op_id = hash_operation(&e, &op);
+            assert_ne!(get_operation_state(&e, &op_id), OperationState::Ready);
         });
     }
 

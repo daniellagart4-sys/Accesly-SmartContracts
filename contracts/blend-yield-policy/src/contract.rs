@@ -66,6 +66,10 @@ pub enum BlendYieldPolicyError {
     WrongRecipients = 9006,
     /// El yield acumulado en el vault es 0 o negativo.
     NoYieldAvailable = 9007,
+    /// El contexto de autorización no es un llamado a contrato.
+    InvalidContext = 9008,
+    /// args[0] no coincide con el smart_account autorizado.
+    WrongSmartAccount = 9009,
 }
 
 // ── Storage ──────────────────────────────────────────────────────────────────
@@ -175,35 +179,42 @@ impl Policy for BlendYieldPolicy {
             panic_with_error!(e, BlendYieldPolicyError::Disabled);
         }
 
-        // 2. Período mínimo
+        // 2. Período mínimo — saturating_add prevents u32 wrap-around
         let current = e.ledger().sequence();
         if cfg.last_distribution > 0
-            && current < cfg.last_distribution + cfg.period_ledgers
+            && current < cfg.last_distribution.saturating_add(cfg.period_ledgers)
         {
             panic_with_error!(e, BlendYieldPolicyError::PeriodNotElapsed);
         }
 
-        // 3. Validar contexto: contrato correcto + función correcta
-        if let Context::Contract(ContractContext { contract, fn_name, args }) = &context {
-            if contract != &cfg.blend_vault {
-                panic_with_error!(e, BlendYieldPolicyError::UnauthorizedVault);
-            }
-            if fn_name != &Symbol::new(e, "distribute_yield") {
-                panic_with_error!(e, BlendYieldPolicyError::UnauthorizedFunction);
-            }
+        // 3. Validar contexto: debe ser un llamado a contrato (fail closed)
+        let (contract, fn_name, args) = match context {
+            Context::Contract(ContractContext { contract, fn_name, args }) => (contract, fn_name, args),
+            _ => panic_with_error!(e, BlendYieldPolicyError::InvalidContext),
+        };
 
-            // 4. Validar wallets en los args de la llamada
-            // distribute_yield(smart_account, developer_wallet, accesly_wallet)
-            // args[0] = smart_account, args[1] = developer_wallet, args[2] = accesly_wallet
-            let developer_arg = args.get(1).and_then(|v| Address::try_from_val(e, &v).ok());
-            let accesly_arg   = args.get(2).and_then(|v| Address::try_from_val(e, &v).ok());
+        if contract != cfg.blend_vault {
+            panic_with_error!(e, BlendYieldPolicyError::UnauthorizedVault);
+        }
+        if fn_name != Symbol::new(e, "distribute_yield") {
+            panic_with_error!(e, BlendYieldPolicyError::UnauthorizedFunction);
+        }
 
-            let developer_ok = developer_arg.map_or(false, |a| a == cfg.developer_wallet);
-            let accesly_ok   = accesly_arg.map_or(false, |a| a == cfg.accesly_wallet);
+        // 4. Validar args: distribute_yield(smart_account, developer_wallet, accesly_wallet)
+        // args[0] = smart_account — must match the account being authorized
+        let account_arg = args.get(0).and_then(|v| Address::try_from_val(e, &v).ok());
+        if account_arg.map_or(true, |a| a != smart_account) {
+            panic_with_error!(e, BlendYieldPolicyError::WrongSmartAccount);
+        }
 
-            if !developer_ok || !accesly_ok {
-                panic_with_error!(e, BlendYieldPolicyError::WrongRecipients);
-            }
+        let developer_arg = args.get(1).and_then(|v| Address::try_from_val(e, &v).ok());
+        let accesly_arg   = args.get(2).and_then(|v| Address::try_from_val(e, &v).ok());
+
+        let developer_ok = developer_arg.map_or(false, |a| a == cfg.developer_wallet);
+        let accesly_ok   = accesly_arg.map_or(false, |a| a == cfg.accesly_wallet);
+
+        if !developer_ok || !accesly_ok {
+            panic_with_error!(e, BlendYieldPolicyError::WrongRecipients);
         }
 
         // 5. Verificar que haya yield disponible
@@ -223,6 +234,7 @@ impl Policy for BlendYieldPolicy {
         context_rule: ContextRule,
         smart_account: Address,
     ) {
+        smart_account.require_auth();
         let key = StorageKey::Config(smart_account.clone(), context_rule.id);
         if e.storage().persistent().has(&key) {
             panic_with_error!(e, BlendYieldPolicyError::AlreadyInstalled);
@@ -239,6 +251,7 @@ impl Policy for BlendYieldPolicy {
     }
 
     fn uninstall(e: &Env, context_rule: ContextRule, smart_account: Address) {
+        smart_account.require_auth();
         let key = StorageKey::Config(smart_account.clone(), context_rule.id);
         if !e.storage().persistent().has(&key) {
             panic_with_error!(e, BlendYieldPolicyError::NotInstalled);
@@ -398,10 +411,14 @@ mod tests {
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
         let rule = make_rule(&e, &vault);
-        e.mock_all_auths();
 
+        e.mock_all_auths();
         e.as_contract(&policy, || {
             BlendYieldPolicy::install(&e, make_params(&vault, &dev, &accesly), rule.clone(), account.clone());
+        });
+
+        e.mock_all_auths();
+        e.as_contract(&policy, || {
             BlendYieldPolicy::install(&e, make_params(&vault, &dev, &accesly), rule.clone(), account.clone());
         });
     }
@@ -449,13 +466,20 @@ mod tests {
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
         let rule = make_rule(&e, &vault);
-        e.mock_all_auths();
 
         MockBlendVaultClient::new(&e, &vault).set_yield(&1_000_000i128);
 
+        e.mock_all_auths();
         e.as_contract(&policy, || {
             BlendYieldPolicy::install(&e, make_params(&vault, &dev, &accesly), rule.clone(), account.clone());
+        });
+
+        e.mock_all_auths();
+        e.as_contract(&policy, || {
             BlendYieldPolicy::set_enabled(e.clone(), rule.id, account.clone(), false);
+        });
+
+        e.as_contract(&policy, || {
             BlendYieldPolicy::enforce(
                 &e,
                 distribute_ctx(&e, &vault, &account, &dev, &accesly),
@@ -626,10 +650,14 @@ mod tests {
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
         let rule = make_rule(&e, &vault);
-        e.mock_all_auths();
 
+        e.mock_all_auths();
         e.as_contract(&policy, || {
             BlendYieldPolicy::install(&e, make_params(&vault, &dev, &accesly), rule.clone(), account.clone());
+        });
+
+        e.mock_all_auths();
+        e.as_contract(&policy, || {
             BlendYieldPolicy::uninstall(&e, rule.clone(), account.clone());
         });
     }

@@ -3,23 +3,18 @@
 //! Política de distribución automática de yield CETES.
 //!
 //! Regla 5 (Issue 1.9): sin firma del usuario, solo yield, semanal.
-//! - El principal es intocable: la política solo autoriza llamadas al
-//!   método de harvest/claim del contrato CETES configurado.
+//! - El principal es intocable: la política solo autoriza llamadas
+//!   `transfer` al SAC estándar (SEP-41) del token CETES de Etherfuse.
 //! - Máximo 50% del yield va a la wallet de Accesly (configurable en BPS).
 //! - Periodo mínimo entre distribuciones: `period_ledgers` (~120960 = 1 semana).
+//!   El período se verifica y actualiza únicamente en la transferencia hacia
+//!   `accesly_wallet`, lo que permite que el relayer incluya dos transferencias
+//!   en la misma tx (porción usuario + porción Accesly) sin conflicto.
 //! - Desactivable por el Smart Account con biométrico (regla admin-cfg).
-//!
-//! Sobre la división 50/50:
-//!   Esta política valida que la llamada sea al contrato CETES correcto y a la
-//!   función de harvest. La división del yield la construye el relayer/SDK en
-//!   la transacción: incluye la llamada harvest + transfer del 50% a Accesly.
-//!   La política valida el contrato, función, timing y estado enabled — el
-//!   enforcement del split exacto requiere conocer el ABI del contrato CETES
-//!   de Etherfuse (se completa cuando el contrato esté disponible en testnet).
 use soroban_sdk::{
     auth::{Context, ContractContext},
     contract, contractimpl, contracttype, panic_with_error,
-    contracterror, Address, Bytes, Env, Symbol, Vec,
+    contracterror, Address, Env, Symbol, TryFromVal, Vec,
 };
 use stellar_accounts::{
     policies::Policy,
@@ -52,12 +47,20 @@ pub enum YieldDistError {
     Disabled = 7002,
     /// Período mínimo entre distribuciones no cumplido.
     PeriodNotElapsed = 7003,
-    /// La función llamada no es la de harvest autorizada.
+    /// La función llamada no es `transfer`.
     UnauthorizedFunction = 7004,
     /// El contrato llamado no es el CETES autorizado.
     UnauthorizedContract = 7005,
     /// BPS de Accesly supera el máximo permitido (5000).
     BpsExceedsMax = 7006,
+    /// El contexto de autorización no es un llamado a contrato.
+    InvalidContext = 7007,
+    /// Los argumentos de la llamada no tienen el formato esperado.
+    InvalidArgs = 7008,
+    /// El campo `from` no es el smart account que instaló la policy.
+    WrongFrom = 7009,
+    /// El monto supera el límite por transferencia configurado.
+    AmountExceeded = 7010,
 }
 
 // ── Storage ──────────────────────────────────────────────────────────────────
@@ -72,16 +75,16 @@ enum StorageKey {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct YieldConfig {
-    /// Dirección del contrato CETES/Etherfuse.
+    /// Dirección del SAC (SEP-41) del token CETES de Etherfuse.
     pub cetes_contract: Address,
-    /// Nombre de la función de harvest (e.g. Symbol::new("harvest")).
-    pub harvest_fn: Symbol,
     /// Wallet de Accesly que recibe su parte del yield.
     pub accesly_wallet: Address,
     /// Ledgers mínimos entre distribuciones (default: WEEK_IN_LEDGERS).
     pub period_ledgers: u32,
     /// Porcentaje del yield en BPS que va a Accesly (máx 5000 = 50%).
     pub accesly_bps: u32,
+    /// Monto máximo por transferencia individual en stroops (0 = sin límite).
+    pub max_amount_per_transfer: i128,
     /// Último ledger en que se distribuyó. 0 = nunca.
     pub last_distribution: u32,
     /// Si está en false, la política rechaza cualquier distribución.
@@ -94,10 +97,10 @@ pub struct YieldConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub struct YieldInstallParams {
     pub cetes_contract: Address,
-    pub harvest_fn: Symbol,
     pub accesly_wallet: Address,
     pub period_ledgers: u32,
     pub accesly_bps: u32,
+    pub max_amount_per_transfer: i128,
 }
 
 // ── Helpers de storage ────────────────────────────────────────────────────────
@@ -149,27 +152,54 @@ impl Policy for YieldDistributionPolicy {
             panic_with_error!(e, YieldDistError::Disabled);
         }
 
-        // 2. Período mínimo
-        let current = e.ledger().sequence();
-        if cfg.last_distribution > 0
-            && current < cfg.last_distribution + cfg.period_ledgers
-        {
-            panic_with_error!(e, YieldDistError::PeriodNotElapsed);
+        // 2. Contexto debe ser Contract (fail closed)
+        let (contract, fn_name, args) = match context {
+            Context::Contract(ContractContext { contract, fn_name, args }) => {
+                (contract, fn_name, args)
+            }
+            _ => panic_with_error!(e, YieldDistError::InvalidContext),
+        };
+
+        // 3. Solo el SAC de CETES configurado, solo transfer (SEP-41)
+        if contract != cfg.cetes_contract {
+            panic_with_error!(e, YieldDistError::UnauthorizedContract);
+        }
+        if fn_name != Symbol::new(e, "transfer") {
+            panic_with_error!(e, YieldDistError::UnauthorizedFunction);
         }
 
-        // 3. Validar contrato y función del contexto
-        if let Context::Contract(ContractContext { contract, fn_name, .. }) = &context {
-            if contract != &cfg.cetes_contract {
-                panic_with_error!(e, YieldDistError::UnauthorizedContract);
-            }
-            if fn_name != &cfg.harvest_fn {
-                panic_with_error!(e, YieldDistError::UnauthorizedFunction);
-            }
+        // transfer(from: Address, to: Address, amount: i128)
+        let from = args.get(0)
+            .and_then(|v| Address::try_from_val(e, &v).ok())
+            .unwrap_or_else(|| panic_with_error!(e, YieldDistError::InvalidArgs));
+        if from != smart_account {
+            panic_with_error!(e, YieldDistError::WrongFrom);
         }
 
-        // 4. Actualizar timestamp de última distribución
-        cfg.last_distribution = current;
-        save_config(e, &smart_account, context_rule.id, &cfg);
+        let to = args.get(1)
+            .and_then(|v| Address::try_from_val(e, &v).ok())
+            .unwrap_or_else(|| panic_with_error!(e, YieldDistError::InvalidArgs));
+
+        let amount = args.get(2)
+            .and_then(|v| i128::try_from_val(e, &v).ok())
+            .unwrap_or_else(|| panic_with_error!(e, YieldDistError::InvalidArgs));
+
+        if cfg.max_amount_per_transfer > 0 && amount > cfg.max_amount_per_transfer {
+            panic_with_error!(e, YieldDistError::AmountExceeded);
+        }
+
+        // 4. El período se verifica y actualiza solo en la transferencia a accesly_wallet.
+        //    Esto permite dos transfers en la misma tx (usuario + Accesly) sin conflicto.
+        if to == cfg.accesly_wallet {
+            let current = e.ledger().sequence();
+            if cfg.last_distribution > 0
+                && current < cfg.last_distribution.saturating_add(cfg.period_ledgers)
+            {
+                panic_with_error!(e, YieldDistError::PeriodNotElapsed);
+            }
+            cfg.last_distribution = current;
+            save_config(e, &smart_account, context_rule.id, &cfg);
+        }
     }
 
     fn install(
@@ -178,6 +208,7 @@ impl Policy for YieldDistributionPolicy {
         context_rule: ContextRule,
         smart_account: Address,
     ) {
+        smart_account.require_auth();
         let key = StorageKey::YieldConfig(smart_account.clone(), context_rule.id);
         if e.storage().persistent().has(&key) {
             panic_with_error!(e, YieldDistError::AlreadyInstalled);
@@ -187,10 +218,10 @@ impl Policy for YieldDistributionPolicy {
         }
         let cfg = YieldConfig {
             cetes_contract: install_params.cetes_contract,
-            harvest_fn: install_params.harvest_fn,
             accesly_wallet: install_params.accesly_wallet,
             period_ledgers: install_params.period_ledgers,
             accesly_bps: install_params.accesly_bps,
+            max_amount_per_transfer: install_params.max_amount_per_transfer,
             last_distribution: 0,
             enabled: true,
         };
@@ -198,6 +229,7 @@ impl Policy for YieldDistributionPolicy {
     }
 
     fn uninstall(e: &Env, context_rule: ContextRule, smart_account: Address) {
+        smart_account.require_auth();
         let key = StorageKey::YieldConfig(smart_account.clone(), context_rule.id);
         if !e.storage().persistent().has(&key) {
             panic_with_error!(e, YieldDistError::NotInstalled);
@@ -260,7 +292,7 @@ mod tests {
         testutils::{Address as _, Ledger},
         Address, Env, IntoVal, String, Vec,
     };
-    use stellar_accounts::smart_account::{ContextRule, ContextRuleType, Signer};
+    use stellar_accounts::smart_account::{ContextRule, ContextRuleType};
 
     use super::*;
 
@@ -283,18 +315,22 @@ mod tests {
     fn make_params(e: &Env, cetes: &Address, accesly: &Address) -> YieldInstallParams {
         YieldInstallParams {
             cetes_contract: cetes.clone(),
-            harvest_fn: Symbol::new(e, "harvest"),
             accesly_wallet: accesly.clone(),
             period_ledgers: WEEK_IN_LEDGERS,
             accesly_bps: 5000,
+            max_amount_per_transfer: 0,
         }
     }
 
-    fn harvest_ctx(e: &Env, cetes: &Address) -> Context {
+    fn transfer_ctx(e: &Env, cetes: &Address, from: &Address, to: &Address, amount: i128) -> Context {
+        let mut args = Vec::new(e);
+        args.push_back(from.clone().into_val(e));
+        args.push_back(to.clone().into_val(e));
+        args.push_back(amount.into_val(e));
         Context::Contract(ContractContext {
             contract: cetes.clone(),
-            fn_name: Symbol::new(e, "harvest"),
-            args: soroban_sdk::Vec::new(e),
+            fn_name: Symbol::new(e, "transfer"),
+            args,
         })
     }
 
@@ -329,10 +365,14 @@ mod tests {
         let cetes = Address::generate(&e);
         let accesly = Address::generate(&e);
         let rule = make_rule(&e);
-        e.mock_all_auths();
 
+        e.mock_all_auths();
         e.as_contract(&addr, || {
             YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly), rule.clone(), account.clone());
+        });
+
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
             YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly), rule.clone(), account.clone());
         });
     }
@@ -365,10 +405,14 @@ mod tests {
         let cetes = Address::generate(&e);
         let accesly = Address::generate(&e);
         let rule = make_rule(&e);
-        e.mock_all_auths();
 
+        e.mock_all_auths();
         e.as_contract(&addr, || {
             YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly), rule.clone(), account.clone());
+        });
+
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
             YieldDistributionPolicy::uninstall(&e, rule.clone(), account.clone());
         });
     }
@@ -421,7 +465,7 @@ mod tests {
     // ── enforce ───────────────────────────────────────────────────────────────
 
     #[test]
-    fn enforce_valid_passes_and_updates_timestamp() {
+    fn enforce_transfer_to_accesly_updates_timestamp() {
         let e = Env::default();
         let addr = e.register(MockContract, ());
         let account = Address::generate(&e);
@@ -433,11 +477,37 @@ mod tests {
 
         e.as_contract(&addr, || {
             YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly), rule.clone(), account.clone());
+            // Transfer to accesly_wallet → period se actualiza
             YieldDistributionPolicy::enforce(
-                &e, harvest_ctx(&e, &cetes), Vec::new(&e), rule.clone(), account.clone(),
+                &e, transfer_ctx(&e, &cetes, &account, &accesly, 500_000),
+                Vec::new(&e), rule.clone(), account.clone(),
             );
             let cfg = YieldDistributionPolicy::get_config(e.clone(), rule.id, account.clone());
             assert_eq!(cfg.last_distribution, 1000);
+        });
+    }
+
+    #[test]
+    fn enforce_transfer_to_user_does_not_update_timestamp() {
+        let e = Env::default();
+        let addr = e.register(MockContract, ());
+        let account = Address::generate(&e);
+        let cetes = Address::generate(&e);
+        let accesly = Address::generate(&e);
+        let user = Address::generate(&e);
+        let rule = make_rule(&e);
+        e.mock_all_auths();
+        e.ledger().with_mut(|l| l.sequence_number = 1000);
+
+        e.as_contract(&addr, || {
+            YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly), rule.clone(), account.clone());
+            // Transfer to user → period NO se actualiza
+            YieldDistributionPolicy::enforce(
+                &e, transfer_ctx(&e, &cetes, &account, &user, 500_000),
+                Vec::new(&e), rule.clone(), account.clone(),
+            );
+            let cfg = YieldDistributionPolicy::get_config(e.clone(), rule.id, account.clone());
+            assert_eq!(cfg.last_distribution, 0); // sin cambio
         });
     }
 
@@ -450,13 +520,21 @@ mod tests {
         let cetes = Address::generate(&e);
         let accesly = Address::generate(&e);
         let rule = make_rule(&e);
-        e.mock_all_auths();
 
+        e.mock_all_auths();
         e.as_contract(&addr, || {
             YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly), rule.clone(), account.clone());
+        });
+
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
             YieldDistributionPolicy::set_enabled(e.clone(), rule.id, account.clone(), false);
+        });
+
+        e.as_contract(&addr, || {
             YieldDistributionPolicy::enforce(
-                &e, harvest_ctx(&e, &cetes), Vec::new(&e), rule.clone(), account.clone(),
+                &e, transfer_ctx(&e, &cetes, &account, &accesly, 500_000),
+                Vec::new(&e), rule.clone(), account.clone(),
             );
         });
     }
@@ -475,13 +553,15 @@ mod tests {
 
         e.as_contract(&addr, || {
             YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly), rule.clone(), account.clone());
-            // Primera distribución: ok
+            // Primera distribución a accesly: ok
             YieldDistributionPolicy::enforce(
-                &e, harvest_ctx(&e, &cetes), Vec::new(&e), rule.clone(), account.clone(),
+                &e, transfer_ctx(&e, &cetes, &account, &accesly, 500_000),
+                Vec::new(&e), rule.clone(), account.clone(),
             );
-            // Segunda inmediata: falla
+            // Segunda inmediata a accesly: falla período
             YieldDistributionPolicy::enforce(
-                &e, harvest_ctx(&e, &cetes), Vec::new(&e), rule.clone(), account.clone(),
+                &e, transfer_ctx(&e, &cetes, &account, &accesly, 500_000),
+                Vec::new(&e), rule.clone(), account.clone(),
             );
         });
     }
@@ -501,7 +581,8 @@ mod tests {
         e.as_contract(&addr, || {
             YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly), rule.clone(), account.clone());
             YieldDistributionPolicy::enforce(
-                &e, harvest_ctx(&e, &wrong), Vec::new(&e), rule.clone(), account.clone(),
+                &e, transfer_ctx(&e, &wrong, &account, &accesly, 500_000),
+                Vec::new(&e), rule.clone(), account.clone(),
             );
         });
     }
@@ -521,10 +602,53 @@ mod tests {
             YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly), rule.clone(), account.clone());
             let bad_ctx = Context::Contract(ContractContext {
                 contract: cetes.clone(),
-                fn_name: Symbol::new(&e, "transfer"),
+                fn_name: Symbol::new(&e, "approve"),
                 args: soroban_sdk::Vec::new(&e),
             });
             YieldDistributionPolicy::enforce(&e, bad_ctx, Vec::new(&e), rule.clone(), account.clone());
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #7009)")]
+    fn enforce_wrong_from_fails() {
+        let e = Env::default();
+        let addr = e.register(MockContract, ());
+        let account = Address::generate(&e);
+        let attacker = Address::generate(&e);
+        let cetes = Address::generate(&e);
+        let accesly = Address::generate(&e);
+        let rule = make_rule(&e);
+        e.mock_all_auths();
+
+        e.as_contract(&addr, || {
+            YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly), rule.clone(), account.clone());
+            YieldDistributionPolicy::enforce(
+                &e, transfer_ctx(&e, &cetes, &attacker, &accesly, 500_000),
+                Vec::new(&e), rule.clone(), account.clone(),
+            );
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #7010)")]
+    fn enforce_amount_exceeded_fails() {
+        let e = Env::default();
+        let addr = e.register(MockContract, ());
+        let account = Address::generate(&e);
+        let cetes = Address::generate(&e);
+        let accesly = Address::generate(&e);
+        let rule = make_rule(&e);
+        e.mock_all_auths();
+
+        e.as_contract(&addr, || {
+            let mut params = make_params(&e, &cetes, &accesly);
+            params.max_amount_per_transfer = 100_000;
+            YieldDistributionPolicy::install(&e, params, rule.clone(), account.clone());
+            YieldDistributionPolicy::enforce(
+                &e, transfer_ctx(&e, &cetes, &account, &accesly, 200_000),
+                Vec::new(&e), rule.clone(), account.clone(),
+            );
         });
     }
 
@@ -542,7 +666,8 @@ mod tests {
         e.as_contract(&addr, || {
             YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly), rule.clone(), account.clone());
             YieldDistributionPolicy::enforce(
-                &e, harvest_ctx(&e, &cetes), Vec::new(&e), rule.clone(), account.clone(),
+                &e, transfer_ctx(&e, &cetes, &account, &accesly, 500_000),
+                Vec::new(&e), rule.clone(), account.clone(),
             );
         });
 
@@ -550,7 +675,8 @@ mod tests {
 
         e.as_contract(&addr, || {
             YieldDistributionPolicy::enforce(
-                &e, harvest_ctx(&e, &cetes), Vec::new(&e), rule.clone(), account.clone(),
+                &e, transfer_ctx(&e, &cetes, &account, &accesly, 500_000),
+                Vec::new(&e), rule.clone(), account.clone(),
             );
             let cfg = YieldDistributionPolicy::get_config(e.clone(), rule.id, account.clone());
             assert_eq!(cfg.last_distribution, 1000 + WEEK_IN_LEDGERS);
@@ -591,7 +717,8 @@ mod tests {
         e.as_contract(&addr, || {
             YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly), rule.clone(), account.clone());
             YieldDistributionPolicy::enforce(
-                &e, harvest_ctx(&e, &cetes), Vec::new(&e), rule.clone(), account.clone(),
+                &e, transfer_ctx(&e, &cetes, &account, &accesly, 500_000),
+                Vec::new(&e), rule.clone(), account.clone(),
             );
             let remaining = YieldDistributionPolicy::ledgers_until_next(e.clone(), rule.id, account.clone());
             assert_eq!(remaining, WEEK_IN_LEDGERS);

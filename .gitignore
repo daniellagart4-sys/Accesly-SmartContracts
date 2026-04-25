@@ -4,3 +4,12 @@ target
 # Local settings
 .soroban
 .stellar
+
+# Archivos internos — no subir al repo público
+Accesly_Security_Vulnerabilities.md
+Pendientes_Fase2.md
+Testnet_Deployment.md
+
+# Editor y herramientas locales
+.vscode/
+.claude/

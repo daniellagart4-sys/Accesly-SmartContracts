@@ -1,0 +1,4 @@
+# Stellar SDK v25.3+ requiere esta variable cuando se compila a WASM sin stellar-cli v25.2+.
+# Actualizar stellar-cli a v25.3+ elimina la necesidad de esta variable.
+[env]
+SOROBAN_SDK_BUILD_SYSTEM_SUPPORTS_SPEC_SHAKING_V2 = "1"

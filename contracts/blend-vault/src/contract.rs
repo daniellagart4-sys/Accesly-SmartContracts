@@ -24,9 +24,9 @@
 //! Esto hace que las shares aprecien con el yield de Blend automáticamente.
 //!
 //! ## Constructor params (testnet)
-//!   - usdc_address: USDC SAC en testnet
+//!   - usdc_address: USDC SAC en testnet (Circle: CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU)
 //!   - blend_pool: Blend pool contract en testnet
-//!   - usdc_reserve_index: índice de USDC en el pool (verificar en testnet)
+//!   - usdc_reserve_index: 3 en TestnetV2 (XLM=0, wETH=1, wBTC=2, USDC=3 — obtenido via get_reserve_list())
 //!   - name/symbol: metadatos del share token (e.g. "Accesly Blend USDC", "abUSDC")
 use soroban_sdk::{
     contract, contractimpl, contracttype, panic_with_error,
@@ -54,6 +54,10 @@ pub enum BlendVaultError {
     ExceedsYield = 8001,
     /// Addresses de distribución no coinciden con las configuradas.
     InvalidRecipients = 8002,
+    /// Constructor called after contract is already initialized.
+    AlreadyInitialized = 8003,
+    /// Arithmetic overflow in financial calculation.
+    ArithmeticError = 8004,
 }
 
 // ── Struct de posición del usuario ────────────────────────────────────────────
@@ -95,6 +99,12 @@ impl BlendVaultContract {
         name: String,
         symbol: String,
     ) {
+        // One-time initialization guard: prevent re-initialization post-deploy.
+        if e.storage().instance().has(&storage::StorageKey::Initialized) {
+            panic_with_error!(e, BlendVaultError::AlreadyInitialized);
+        }
+        e.storage().instance().set(&storage::StorageKey::Initialized, &true);
+
         // Guarda config del vault (asset subyacente = USDC)
         Vault::set_asset(e, usdc_address);
         // decimals_offset = 0 (shares y USDC tienen la misma precisión)
@@ -281,7 +291,7 @@ impl BlendVaultContract {
         } else {
             shares
                 .checked_mul(total_ta)
-                .unwrap_or(i128::MAX)
+                .unwrap_or_else(|| panic_with_error!(&e, BlendVaultError::ArithmeticError))
                 .checked_div(total_supply)
                 .unwrap_or(0)
         };
@@ -317,11 +327,16 @@ impl BlendVaultContract {
 
         let yield_amount = position.yield_accrued;
 
-        // Calcular partes (60/30/10)
-        // Usamos aritmética de enteros: primero 10% y 30%, el resto al usuario.
-        let accesly_part   = yield_amount / 10;           // 10%
-        let developer_part = yield_amount * 30 / 100;     // 30%
-        let user_part      = yield_amount - accesly_part - developer_part; // 60%
+        // Calcular partes (60/30/10) con aritmética chequeada para evitar overflow.
+        let accesly_part = yield_amount.checked_div(10)
+            .unwrap_or_else(|| panic_with_error!(&e, BlendVaultError::ArithmeticError));
+        let developer_part = yield_amount.checked_mul(30)
+            .and_then(|v| v.checked_div(100))
+            .unwrap_or_else(|| panic_with_error!(&e, BlendVaultError::ArithmeticError));
+        let user_part = yield_amount
+            .checked_sub(accesly_part)
+            .and_then(|v| v.checked_sub(developer_part))
+            .unwrap_or_else(|| panic_with_error!(&e, BlendVaultError::ArithmeticError));
 
         let pool = storage::get_blend_pool(&e);
         let usdc = Vault::query_asset(&e);

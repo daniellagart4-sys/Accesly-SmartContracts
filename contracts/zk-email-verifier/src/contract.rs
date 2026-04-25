@@ -22,12 +22,20 @@
 //!   clave DKIM en el registry. La integración del verificador ZK se agrega
 //!   en Fase 2 cuando el circuito esté finalizado.
 use soroban_sdk::{
-    contract, contractimpl, contracttype, xdr::FromXdr,
+    contract, contractimpl, contracttype, contracterror, panic_with_error, xdr::FromXdr,
     Address, Bytes, BytesN, Env, Symbol, Vec,
 };
 use stellar_accounts::verifiers::Verifier;
 use stellar_access::access_control::{get_admin, set_admin, AccessControl};
 use stellar_zk_email::dkim_registry::{self, DKIMRegistry};
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[repr(u32)]
+enum ZkVerifierError {
+    /// Constructor called after contract is already initialized.
+    AlreadyInitialized = 100,
+}
 
 fn require_admin(e: &Env) {
     get_admin(e).expect("admin not set").require_auth();
@@ -57,6 +65,10 @@ pub struct ZkEmailVerifier;
 impl ZkEmailVerifier {
     /// Inicializa el contrato con el admin del registry DKIM.
     pub fn __constructor(e: &Env, admin: Address) {
+        // One-time initialization guard: prevent re-initialization post-deploy.
+        if get_admin(e).is_some() {
+            panic_with_error!(e, ZkVerifierError::AlreadyInitialized);
+        }
         set_admin(e, &admin);
     }
 }
@@ -129,11 +141,12 @@ impl Verifier for ZkEmailVerifier {
         _key_data: BytesN<32>,
         sig_data: Bytes,
     ) -> bool {
-        let proof = ZkEmailProof::from_xdr(e, &sig_data)
-            .expect("sig_data must be XDR-encoded ZkEmailProof");
-
-        // Valida que la clave DKIM esté registrada y no revocada
-        dkim_registry::is_key_hash_valid(e, &proof.domain_hash, &proof.public_key_hash)
+        // Fase 2 pendiente: cryptographic ZK proof verification is not yet integrated.
+        // Hard-fail to prevent unauthorized account recovery until groth16/plonk
+        // on-chain verification is implemented and _signature_payload / _key_data
+        // are properly bound to the proof.
+        let _ = (e, sig_data);
+        false
     }
 
     fn canonicalize_key(e: &Env, key_data: BytesN<32>) -> Bytes {
@@ -272,7 +285,9 @@ mod tests {
     // ── Verifier (ZK proof) ───────────────────────────────────────────────────
 
     #[test]
-    fn verify_registered_key_returns_true() {
+    fn verify_returns_false_until_zk_integrated() {
+        // Fase 2 pendiente: verify() hard-fails to prevent unauthorized recovery
+        // until cryptographic ZK proof verification is implemented.
         let e = Env::default();
         let (addr, admin) = deploy(&e);
         e.mock_all_auths();
@@ -287,7 +302,7 @@ mod tests {
         let key_data = BytesN::from_array(&e, &[0u8; 32]);
         let payload = Bytes::from_array(&e, &[9u8; 32]);
 
-        assert!(client.verify(&payload, &key_data, &sig_data));
+        assert!(!client.verify(&payload, &key_data, &sig_data));
     }
 
     #[test]
