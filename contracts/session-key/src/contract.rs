@@ -28,6 +28,9 @@ const DAY_IN_LEDGERS: u32 = 17280;
 const EXTEND_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
 const TTL_THRESHOLD: u32 = EXTEND_AMOUNT - DAY_IN_LEDGERS;
 
+/// Duración máxima de una sesión: 30 días en ledgers.
+pub const MAX_SESSION_DURATION: u32 = 30 * DAY_IN_LEDGERS;
+
 // ── Errores ──────────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -46,6 +49,8 @@ pub enum SessionKeyError {
     NonTransferNotAllowed = 5004,
     /// Monto de transferencia negativo o cero — rechazado para evitar bypass del cap.
     InvalidAmount = 5006,
+    /// La duración de la sesión supera el máximo permitido (30 días).
+    SessionTooLong = 5005,
 }
 
 // ── Storage ──────────────────────────────────────────────────────────────────
@@ -191,6 +196,13 @@ impl Policy for SessionKeyPolicy {
         }
         if install_params.max_amount < 0 {
             panic_with_error!(e, SessionKeyError::InvalidAmount);
+        }
+        let current = e.ledger().sequence();
+        if install_params.expires_at <= current {
+            panic_with_error!(e, SessionKeyError::SessionTooLong);
+        }
+        if install_params.expires_at - current > MAX_SESSION_DURATION {
+            panic_with_error!(e, SessionKeyError::SessionTooLong);
         }
         let data = SessionData {
             expires_at: install_params.expires_at,
@@ -683,6 +695,49 @@ mod tests {
             let d2 = SessionKeyPolicy::get_session(e.clone(), rule.id, acct2.clone());
             assert_eq!(d1.spent, 400_000);
             assert_eq!(d2.spent, 0); // acct2 no tocada
+        });
+    }
+
+    // ── duración máxima de sesión ─────────────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5005)")]
+    fn install_session_too_long_fails() {
+        let e = Env::default();
+        let addr = e.register(MockContract, ());
+        let account = Address::generate(&e);
+        let rule = make_rule(&e);
+        e.mock_all_auths();
+        e.ledger().with_mut(|l| l.sequence_number = 100);
+
+        e.as_contract(&addr, || {
+            // expires_at - current > MAX_SESSION_DURATION → must fail
+            let params = SessionKeyInstallParams {
+                expires_at: 100 + MAX_SESSION_DURATION + 1,
+                max_amount: 0,
+            };
+            SessionKeyPolicy::install(&e, params, rule.clone(), account.clone());
+        });
+    }
+
+    #[test]
+    fn install_session_at_max_duration_passes() {
+        let e = Env::default();
+        let addr = e.register(MockContract, ());
+        let account = Address::generate(&e);
+        let rule = make_rule(&e);
+        e.mock_all_auths();
+        e.ledger().with_mut(|l| l.sequence_number = 100);
+
+        e.as_contract(&addr, || {
+            // expires_at - current == MAX_SESSION_DURATION → must pass
+            let params = SessionKeyInstallParams {
+                expires_at: 100 + MAX_SESSION_DURATION,
+                max_amount: 0,
+            };
+            SessionKeyPolicy::install(&e, params, rule.clone(), account.clone());
+            let data = SessionKeyPolicy::get_session(e.clone(), rule.id, account.clone());
+            assert_eq!(data.expires_at, 100 + MAX_SESSION_DURATION);
         });
     }
 }

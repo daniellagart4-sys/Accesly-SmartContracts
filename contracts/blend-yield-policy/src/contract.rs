@@ -72,6 +72,8 @@ pub enum BlendYieldPolicyError {
     WrongSmartAccount = 9009,
     /// accesly_wallet en install_params no coincide con la wallet canónica del contrato.
     InvalidAcceslyWallet = 9010,
+    /// El constructor ya fue llamado — no se puede reinicializar.
+    AlreadyInitialized = 9011,
 }
 
 // ── Storage ──────────────────────────────────────────────────────────────────
@@ -290,6 +292,9 @@ impl BlendYieldPolicy {
     /// Guarda la wallet canónica de Accesly en instance storage.
     /// Llamado una sola vez al desplegar el contrato.
     pub fn __constructor(e: &Env, accesly_wallet: Address) {
+        if e.storage().instance().has(&InstanceKey::AcceslyWallet) {
+            panic_with_error!(e, BlendYieldPolicyError::AlreadyInitialized);
+        }
         e.storage().instance().set(&InstanceKey::AcceslyWallet, &accesly_wallet);
     }
 
@@ -794,6 +799,23 @@ mod tests {
                 rule.clone(),
                 account.clone(),
             );
+        });
+    }
+
+    // ── constructor re-call guard ─────────────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #9011)")]
+    fn constructor_twice_fails() {
+        let e = Env::default();
+        let accesly = Address::generate(&e);
+        let attacker = Address::generate(&e);
+        // First call happens via e.register (constructor runs at deploy time).
+        let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
+
+        // Second call must fail — attacker cannot overwrite canonical accesly_wallet.
+        e.as_contract(&policy, || {
+            BlendYieldPolicy::__constructor(&e, attacker);
         });
     }
 }
