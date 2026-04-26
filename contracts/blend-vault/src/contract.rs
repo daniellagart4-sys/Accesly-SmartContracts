@@ -89,6 +89,7 @@ impl BlendVaultContract {
     /// * `usdc_address`        — USDC SAC address en testnet.
     /// * `blend_pool`          — Dirección del pool de Blend en testnet.
     /// * `usdc_reserve_index`  — Índice del reserve USDC en el pool (verificar).
+    /// * `accesly_wallet`      — Wallet fija de Accesly — validada en distribute_yield.
     /// * `name`                — Nombre del share token (e.g. "Accesly Blend USDC").
     /// * `symbol`              — Símbolo del share token (e.g. "abUSDC").
     pub fn __constructor(
@@ -96,6 +97,7 @@ impl BlendVaultContract {
         usdc_address: Address,
         blend_pool: Address,
         usdc_reserve_index: u32,
+        accesly_wallet: Address,
         name: String,
         symbol: String,
     ) {
@@ -114,6 +116,7 @@ impl BlendVaultContract {
         // Guarda config de Blend
         storage::set_blend_pool(e, &blend_pool);
         storage::set_usdc_reserve_index(e, usdc_reserve_index);
+        storage::set_accesly_wallet(e, &accesly_wallet);
     }
 }
 
@@ -318,6 +321,11 @@ impl BlendVaultContract {
     ) {
         // Requiere auth del Smart Account → dispara blend-yield-policy
         smart_account.require_auth();
+
+        // Validate accesly_wallet against the fixed address stored at deploy time.
+        if accesly_wallet != storage::get_accesly_wallet(&e) {
+            panic_with_error!(&e, BlendVaultError::InvalidRecipients);
+        }
 
         let position = Self::get_position(e.clone(), smart_account.clone());
 

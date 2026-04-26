@@ -70,9 +70,18 @@ pub enum BlendYieldPolicyError {
     InvalidContext = 9008,
     /// args[0] no coincide con el smart_account autorizado.
     WrongSmartAccount = 9009,
+    /// accesly_wallet en install_params no coincide con la wallet canónica del contrato.
+    InvalidAcceslyWallet = 9010,
 }
 
 // ── Storage ──────────────────────────────────────────────────────────────────
+
+/// Instance storage key — holds contract-level config set at deploy time.
+#[contracttype]
+#[derive(Clone)]
+enum InstanceKey {
+    AcceslyWallet,
+}
 
 #[contracttype]
 #[derive(Clone)]
@@ -128,6 +137,13 @@ fn save_config(e: &Env, smart_account: &Address, context_rule_id: u32, cfg: &Ble
     e.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, EXTEND_AMOUNT);
 }
 
+fn get_canonical_accesly_wallet(e: &Env) -> Address {
+    e.storage()
+        .instance()
+        .get(&InstanceKey::AcceslyWallet)
+        .expect("accesly wallet not set")
+}
+
 /// Llama `blend_vault.get_position(smart_account)` y devuelve el yield_accrued.
 fn get_yield_from_vault(e: &Env, vault: &Address, smart_account: &Address) -> i128 {
     // Definimos sólo el campo que nos interesa de UserPosition.
@@ -172,6 +188,9 @@ impl Policy for BlendYieldPolicy {
         context_rule: ContextRule,
         smart_account: Address,
     ) {
+        // Bind enforce to the SA's auth flow — prevents direct external calls.
+        smart_account.require_auth();
+
         let mut cfg = load_config(e, &smart_account, context_rule.id);
 
         // 1. Habilitado
@@ -235,6 +254,12 @@ impl Policy for BlendYieldPolicy {
         smart_account: Address,
     ) {
         smart_account.require_auth();
+
+        // Validate accesly_wallet against the canonical address stored at deploy time.
+        if install_params.accesly_wallet != get_canonical_accesly_wallet(e) {
+            panic_with_error!(e, BlendYieldPolicyError::InvalidAcceslyWallet);
+        }
+
         let key = StorageKey::Config(smart_account.clone(), context_rule.id);
         if e.storage().persistent().has(&key) {
             panic_with_error!(e, BlendYieldPolicyError::AlreadyInstalled);
@@ -262,6 +287,12 @@ impl Policy for BlendYieldPolicy {
 
 #[contractimpl]
 impl BlendYieldPolicy {
+    /// Guarda la wallet canónica de Accesly en instance storage.
+    /// Llamado una sola vez al desplegar el contrato.
+    pub fn __constructor(e: &Env, accesly_wallet: Address) {
+        e.storage().instance().set(&InstanceKey::AcceslyWallet, &accesly_wallet);
+    }
+
     /// Habilita o deshabilita la distribución.
     /// Requiere autorización del Smart Account (context rule admin-cfg con biométrico).
     pub fn set_enabled(
@@ -383,11 +414,11 @@ mod tests {
     #[test]
     fn install_success() {
         let e = Env::default();
-        let policy = e.register(BlendYieldPolicy, ());
         let vault = e.register(MockBlendVault, ());
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
         e.mock_all_auths();
 
@@ -405,11 +436,11 @@ mod tests {
     #[should_panic(expected = "Error(Contract, #9001)")]
     fn install_twice_fails() {
         let e = Env::default();
-        let policy = e.register(BlendYieldPolicy, ());
         let vault = e.register(MockBlendVault, ());
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
 
         e.mock_all_auths();
@@ -428,20 +459,22 @@ mod tests {
     #[test]
     fn enforce_valid_passes() {
         let e = Env::default();
-        let policy = e.register(BlendYieldPolicy, ());
         let vault = e.register(MockBlendVault, ());
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
         e.mock_all_auths();
         e.ledger().with_mut(|l| l.sequence_number = 1000);
 
-        // Configura yield > 0 en el mock
         MockBlendVaultClient::new(&e, &vault).set_yield(&1_000_000i128);
 
         e.as_contract(&policy, || {
             BlendYieldPolicy::install(&e, make_params(&vault, &dev, &accesly), rule.clone(), account.clone());
+        });
+
+        e.as_contract(&policy, || {
             BlendYieldPolicy::enforce(
                 &e,
                 distribute_ctx(&e, &vault, &account, &dev, &accesly),
@@ -460,11 +493,11 @@ mod tests {
     #[should_panic(expected = "Error(Contract, #9002)")]
     fn enforce_disabled_fails() {
         let e = Env::default();
-        let policy = e.register(BlendYieldPolicy, ());
         let vault = e.register(MockBlendVault, ());
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
 
         MockBlendVaultClient::new(&e, &vault).set_yield(&1_000_000i128);
@@ -492,11 +525,11 @@ mod tests {
     #[should_panic(expected = "Error(Contract, #9003)")]
     fn enforce_period_not_elapsed_fails() {
         let e = Env::default();
-        let policy = e.register(BlendYieldPolicy, ());
         let vault = e.register(MockBlendVault, ());
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
         e.mock_all_auths();
         e.ledger().with_mut(|l| l.sequence_number = 1000);
@@ -505,11 +538,17 @@ mod tests {
 
         e.as_contract(&policy, || {
             BlendYieldPolicy::install(&e, make_params(&vault, &dev, &accesly), rule.clone(), account.clone());
+        });
+
+        e.as_contract(&policy, || {
             BlendYieldPolicy::enforce(
                 &e, distribute_ctx(&e, &vault, &account, &dev, &accesly),
                 Vec::new(&e), rule.clone(), account.clone(),
             );
-            // Segunda llamada inmediata: falla
+        });
+
+        // Segunda llamada inmediata: debe fallar con PeriodNotElapsed
+        e.as_contract(&policy, || {
             BlendYieldPolicy::enforce(
                 &e, distribute_ctx(&e, &vault, &account, &dev, &accesly),
                 Vec::new(&e), rule.clone(), account.clone(),
@@ -521,12 +560,12 @@ mod tests {
     #[should_panic(expected = "Error(Contract, #9005)")]
     fn enforce_wrong_vault_fails() {
         let e = Env::default();
-        let policy = e.register(BlendYieldPolicy, ());
         let vault = e.register(MockBlendVault, ());
         let wrong_vault = Address::generate(&e);
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
         e.mock_all_auths();
 
@@ -534,6 +573,9 @@ mod tests {
 
         e.as_contract(&policy, || {
             BlendYieldPolicy::install(&e, make_params(&vault, &dev, &accesly), rule.clone(), account.clone());
+        });
+
+        e.as_contract(&policy, || {
             BlendYieldPolicy::enforce(
                 &e,
                 distribute_ctx(&e, &wrong_vault, &account, &dev, &accesly),
@@ -546,11 +588,11 @@ mod tests {
     #[should_panic(expected = "Error(Contract, #9004)")]
     fn enforce_wrong_function_fails() {
         let e = Env::default();
-        let policy = e.register(BlendYieldPolicy, ());
         let vault = e.register(MockBlendVault, ());
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
         e.mock_all_auths();
 
@@ -558,6 +600,9 @@ mod tests {
 
         e.as_contract(&policy, || {
             BlendYieldPolicy::install(&e, make_params(&vault, &dev, &accesly), rule.clone(), account.clone());
+        });
+
+        e.as_contract(&policy, || {
             let bad_ctx = Context::Contract(ContractContext {
                 contract: vault.clone(),
                 fn_name: Symbol::new(&e, "redeem"),
@@ -571,12 +616,12 @@ mod tests {
     #[should_panic(expected = "Error(Contract, #9006)")]
     fn enforce_wrong_recipients_fails() {
         let e = Env::default();
-        let policy = e.register(BlendYieldPolicy, ());
         let vault = e.register(MockBlendVault, ());
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
         let wrong_dev = Address::generate(&e); // dev incorrecto
+        let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
         e.mock_all_auths();
 
@@ -584,6 +629,9 @@ mod tests {
 
         e.as_contract(&policy, || {
             BlendYieldPolicy::install(&e, make_params(&vault, &dev, &accesly), rule.clone(), account.clone());
+        });
+
+        e.as_contract(&policy, || {
             BlendYieldPolicy::enforce(
                 &e,
                 distribute_ctx(&e, &vault, &account, &wrong_dev, &accesly),
@@ -596,11 +644,11 @@ mod tests {
     #[should_panic(expected = "Error(Contract, #9007)")]
     fn enforce_no_yield_fails() {
         let e = Env::default();
-        let policy = e.register(BlendYieldPolicy, ());
         let vault = e.register(MockBlendVault, ());
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
         e.mock_all_auths();
 
@@ -609,6 +657,9 @@ mod tests {
 
         e.as_contract(&policy, || {
             BlendYieldPolicy::install(&e, make_params(&vault, &dev, &accesly), rule.clone(), account.clone());
+        });
+
+        e.as_contract(&policy, || {
             BlendYieldPolicy::enforce(
                 &e,
                 distribute_ctx(&e, &vault, &account, &dev, &accesly),
@@ -622,11 +673,11 @@ mod tests {
     #[test]
     fn ledgers_until_next_zero_on_first() {
         let e = Env::default();
-        let policy = e.register(BlendYieldPolicy, ());
         let vault = e.register(MockBlendVault, ());
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
         e.mock_all_auths();
 
@@ -644,11 +695,11 @@ mod tests {
     #[test]
     fn uninstall_success() {
         let e = Env::default();
-        let policy = e.register(BlendYieldPolicy, ());
         let vault = e.register(MockBlendVault, ());
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
 
         e.mock_all_auths();
@@ -666,14 +717,83 @@ mod tests {
     #[should_panic(expected = "Error(Contract, #9000)")]
     fn uninstall_not_installed_fails() {
         let e = Env::default();
-        let policy = e.register(BlendYieldPolicy, ());
         let vault = e.register(MockBlendVault, ());
+        let accesly = Address::generate(&e);
+        let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let account = Address::generate(&e);
         let rule = make_rule(&e, &vault);
         e.mock_all_auths();
 
         e.as_contract(&policy, || {
             BlendYieldPolicy::uninstall(&e, rule.clone(), account.clone());
+        });
+    }
+
+    // ── seguridad: enforce sin auth del SA ────────────────────────────────────
+
+    #[test]
+    #[should_panic]
+    fn enforce_unauthorized_fails() {
+        let e = Env::default();
+        // NO mock_all_auths — enforce must fail at smart_account.require_auth().
+        let vault = e.register(MockBlendVault, ());
+        let account = Address::generate(&e);
+        let dev = Address::generate(&e);
+        let accesly = Address::generate(&e);
+        let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
+        let rule = make_rule(&e, &vault);
+        e.ledger().with_mut(|l| l.sequence_number = 1000);
+
+        MockBlendVaultClient::new(&e, &vault).set_yield(&1_000_000i128);
+
+        // Insert config directly — bypasses install() which calls require_auth.
+        e.as_contract(&policy, || {
+            let cfg = BlendYieldConfig {
+                blend_vault: vault.clone(),
+                developer_wallet: dev.clone(),
+                accesly_wallet: accesly.clone(),
+                period_ledgers: WEEK_IN_LEDGERS,
+                last_distribution: 0,
+                enabled: true,
+            };
+            save_config(&e, &account, rule.id, &cfg);
+        });
+
+        // Enforce without any auth mock — smart_account.require_auth() must fail.
+        e.as_contract(&policy, || {
+            BlendYieldPolicy::enforce(
+                &e,
+                distribute_ctx(&e, &vault, &account, &dev, &accesly),
+                Vec::new(&e),
+                rule.clone(),
+                account.clone(),
+            );
+        });
+    }
+
+    // ── seguridad: accesly_wallet inválida en install ─────────────────────────
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #9010)")]
+    fn install_invalid_accesly_wallet_fails() {
+        let e = Env::default();
+        let vault = e.register(MockBlendVault, ());
+        let account = Address::generate(&e);
+        let dev = Address::generate(&e);
+        let accesly = Address::generate(&e);
+        let wrong_accesly = Address::generate(&e); // distinta de la canónica
+        let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
+        let rule = make_rule(&e, &vault);
+        e.mock_all_auths();
+
+        e.as_contract(&policy, || {
+            // wrong_accesly != canonical accesly → debe fallar con InvalidAcceslyWallet
+            BlendYieldPolicy::install(
+                &e,
+                make_params(&vault, &dev, &wrong_accesly),
+                rule.clone(),
+                account.clone(),
+            );
         });
     }
 }

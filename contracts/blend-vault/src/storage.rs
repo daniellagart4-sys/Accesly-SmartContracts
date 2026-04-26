@@ -28,6 +28,8 @@ pub enum StorageKey {
     BlendPool,
     /// Índice del reserve USDC en el pool de Blend (varía por pool)
     UsdcReserveIndex,
+    /// Wallet fija de Accesly — validada en distribute_yield para evitar redireccionamiento de fees.
+    AcceslyWallet,
     /// Principal depositado por usuario (en USDC/stroops)
     UserPrincipal(Address),
 }
@@ -48,6 +50,14 @@ pub fn set_usdc_reserve_index(e: &Env, index: u32) {
 
 pub fn get_usdc_reserve_index(e: &Env) -> u32 {
     e.storage().instance().get(&StorageKey::UsdcReserveIndex).expect("reserve index not set")
+}
+
+pub fn set_accesly_wallet(e: &Env, wallet: &Address) {
+    e.storage().instance().set(&StorageKey::AcceslyWallet, wallet);
+}
+
+pub fn get_accesly_wallet(e: &Env) -> Address {
+    e.storage().instance().get(&StorageKey::AcceslyWallet).expect("accesly wallet not set")
 }
 
 // ── Principal por usuario ─────────────────────────────────────────────────────

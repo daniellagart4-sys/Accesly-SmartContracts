@@ -5,7 +5,7 @@ use soroban_sdk::{
     testutils::{Address as _, StellarAssetContract},
     token::StellarAssetClient,
     Address, Env, Map, String,
-}
+};
 
 use crate::{
     blend_client::{BlendPositions, BlendReserveData, BlendRequest, SCALAR_7},
@@ -99,9 +99,10 @@ fn setup(e: &Env) -> (Address, Address, Address, Address) {
     let usdc_issuer = Address::generate(e);
     let sac: StellarAssetContract = e.register_stellar_asset_contract_v2(usdc_issuer.clone());
     let usdc = sac.address();
+    let accesly = Address::generate(e);
     let vault = e.register(
         BlendVaultContract,
-        (&usdc, &pool, &0u32, &String::from_str(e, "Accesly Blend USDC"), &String::from_str(e, "abUSDC")),
+        (&usdc, &pool, &0u32, &accesly, &String::from_str(e, "Accesly Blend USDC"), &String::from_str(e, "abUSDC")),
     );
     (vault, pool, usdc, usdc_issuer)
 }
