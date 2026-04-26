@@ -221,19 +221,17 @@ fn total_assets_reads_blend_positions() {
 #[test]
 fn b_tokens_to_usdc_math() {
     // 1000 bTokens * SCALAR_7 / SCALAR_7 = 1000
-    assert_eq!(crate::blend_client::b_tokens_to_usdc(1000, SCALAR_7), 1000);
+    assert_eq!(crate::blend_client::b_tokens_to_usdc(1000, SCALAR_7), Some(1000));
     // 1000 bTokens * (SCALAR_7 * 2) / SCALAR_7 = 2000
-    assert_eq!(crate::blend_client::b_tokens_to_usdc(1000, SCALAR_7 * 2), 2000);
+    assert_eq!(crate::blend_client::b_tokens_to_usdc(1000, SCALAR_7 * 2), Some(2000));
     // cero tokens → cero
-    assert_eq!(crate::blend_client::b_tokens_to_usdc(0, SCALAR_7), 0);
+    assert_eq!(crate::blend_client::b_tokens_to_usdc(0, SCALAR_7), Some(0));
 }
 
 #[test]
-#[should_panic(expected = "bToken valuation overflow")]
-fn b_tokens_to_usdc_overflow_panics() {
-    // Overflow must panic (fail closed) instead of silently returning MAX,
-    // which would corrupt share pricing and total_assets().
-    crate::blend_client::b_tokens_to_usdc(i128::MAX, i128::MAX);
+fn b_tokens_to_usdc_overflow_returns_none() {
+    // Overflow returns None (caller panics with BlendVaultError::ArithmeticError).
+    assert!(crate::blend_client::b_tokens_to_usdc(i128::MAX, i128::MAX).is_none());
 }
 
 #[test]

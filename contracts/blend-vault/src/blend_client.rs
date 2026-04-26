@@ -151,12 +151,7 @@ pub fn get_b_rate(e: &Env, pool: &Address, usdc: &Address) -> i128 {
 }
 
 /// Calcula el valor en USDC de los bTokens del vault.
-pub fn b_tokens_to_usdc(b_tokens: i128, b_rate: i128) -> i128 {
-    // Fail closed on overflow — silently returning i128::MAX would break
-    // share pricing and total_assets(), potentially allowing deposit/withdraw exploits.
-    b_tokens
-        .checked_mul(b_rate)
-        .expect("bToken valuation overflow: b_tokens * b_rate")
-        .checked_div(SCALAR_7)
-        .unwrap_or(0)
+/// Devuelve None en overflow o si b_rate es inválido.
+pub fn b_tokens_to_usdc(b_tokens: i128, b_rate: i128) -> Option<i128> {
+    b_tokens.checked_mul(b_rate)?.checked_div(SCALAR_7)
 }

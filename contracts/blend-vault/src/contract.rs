@@ -153,7 +153,11 @@ impl FungibleVault for BlendVaultContract {
 
         let usdc = Vault::query_asset(e);
         let b_rate = blend_client::get_b_rate(e, &pool, &usdc);
+        if b_rate <= 0 {
+            panic_with_error!(e, BlendVaultError::ArithmeticError);
+        }
         blend_client::b_tokens_to_usdc(b_tokens, b_rate)
+            .unwrap_or_else(|| panic_with_error!(e, BlendVaultError::ArithmeticError))
     }
 
     // ── Override: deposit → USDC va a Blend ──────────────────────────────────
@@ -346,6 +350,16 @@ impl BlendVaultContract {
             .and_then(|v| v.checked_sub(developer_part))
             .unwrap_or_else(|| panic_with_error!(&e, BlendVaultError::ArithmeticError));
 
+        // Burn the claimant's shares proportional to yield_amount before withdrawing.
+        // This prevents externalizing the withdrawal cost onto other depositors:
+        // after burning, their share of total_assets is unaffected by this payout.
+        let yield_shares = Vault::preview_withdraw(&e, yield_amount);
+        let claimant_shares = Base::balance(&e, &smart_account);
+        if yield_shares > claimant_shares {
+            panic_with_error!(&e, BlendVaultError::ExceedsYield);
+        }
+        Base::update(&e, Some(&smart_account), None, yield_shares);
+
         let pool = storage::get_blend_pool(&e);
         let usdc = Vault::query_asset(&e);
         let usdc_client = token::Client::new(&e, &usdc);
@@ -357,9 +371,5 @@ impl BlendVaultContract {
         usdc_client.transfer(&e.current_contract_address(), &smart_account, &user_part);
         usdc_client.transfer(&e.current_contract_address(), &developer_wallet, &developer_part);
         usdc_client.transfer(&e.current_contract_address(), &accesly_wallet, &accesly_part);
-
-        // El principal no se toca — solo actualizamos el stored principal para
-        // reflejar que el yield fue extraído (el valor en Blend bajó = bTokens quemados).
-        // El principal sigue igual porque solo se retiró yield, no principal.
     }
 }

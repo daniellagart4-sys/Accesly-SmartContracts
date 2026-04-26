@@ -189,6 +189,9 @@ impl Policy for SessionKeyPolicy {
         if e.storage().persistent().has(&key) {
             panic_with_error!(e, SessionKeyError::AlreadyInstalled);
         }
+        if install_params.max_amount < 0 {
+            panic_with_error!(e, SessionKeyError::InvalidAmount);
+        }
         let data = SessionData {
             expires_at: install_params.expires_at,
             max_amount: install_params.max_amount,
@@ -328,6 +331,21 @@ mod tests {
         e.mock_all_auths();
         e.as_contract(&addr, || {
             let params = SessionKeyInstallParams { expires_at: 1000, max_amount: 0 };
+            SessionKeyPolicy::install(&e, params, rule.clone(), account.clone());
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5006)")]
+    fn install_negative_max_amount_fails() {
+        let e = Env::default();
+        let addr = e.register(MockContract, ());
+        let account = Address::generate(&e);
+        let rule = make_rule(&e);
+        e.mock_all_auths();
+
+        e.as_contract(&addr, || {
+            let params = SessionKeyInstallParams { expires_at: 1000, max_amount: -1 };
             SessionKeyPolicy::install(&e, params, rule.clone(), account.clone());
         });
     }

@@ -93,6 +93,7 @@ impl Policy for UpgradeRulePolicy {
         context_rule: ContextRule,
         smart_account: Address,
     ) {
+        smart_account.require_auth();
         let cfg = load_config(e, &smart_account, context_rule.id);
 
         let (contract, fn_name) = match context {
@@ -268,12 +269,16 @@ mod tests {
         let account = Address::generate(&e);
         let target = Address::generate(&e);
         let rule = make_rule(&e);
-        e.mock_all_auths();
 
+        e.mock_all_auths();
         e.as_contract(&addr, || {
             UpgradeRulePolicy::install(&e, UpgradeRuleInstallParams {
                 target_contract: target.clone(),
             }, rule.clone(), account.clone());
+        });
+
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
             UpgradeRulePolicy::enforce(
                 &e,
                 upgrade_ctx(&e, &target),
@@ -293,12 +298,16 @@ mod tests {
         let target = Address::generate(&e);
         let other = Address::generate(&e);
         let rule = make_rule(&e);
-        e.mock_all_auths();
 
+        e.mock_all_auths();
         e.as_contract(&addr, || {
             UpgradeRulePolicy::install(&e, UpgradeRuleInstallParams {
                 target_contract: target.clone(),
             }, rule.clone(), account.clone());
+        });
+
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
             UpgradeRulePolicy::enforce(
                 &e,
                 upgrade_ctx(&e, &other),
@@ -317,13 +326,16 @@ mod tests {
         let account = Address::generate(&e);
         let target = Address::generate(&e);
         let rule = make_rule(&e);
-        e.mock_all_auths();
 
+        e.mock_all_auths();
         e.as_contract(&addr, || {
             UpgradeRulePolicy::install(&e, UpgradeRuleInstallParams {
                 target_contract: target.clone(),
             }, rule.clone(), account.clone());
+        });
 
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
             let ctx = Context::Contract(ContractContext {
                 contract: target.clone(),
                 fn_name: symbol_short!("set_admin"),
@@ -341,12 +353,16 @@ mod tests {
         let account = Address::generate(&e);
         let target = Address::generate(&e);
         let rule = make_rule(&e);
-        e.mock_all_auths();
 
+        e.mock_all_auths();
         e.as_contract(&addr, || {
             UpgradeRulePolicy::install(&e, UpgradeRuleInstallParams {
                 target_contract: target.clone(),
             }, rule.clone(), account.clone());
+        });
+
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
             UpgradeRulePolicy::enforce(
                 &e,
                 Context::CreateContractHostFn(soroban_sdk::auth::CreateContractHostFnContext {
@@ -355,6 +371,32 @@ mod tests {
                     ),
                     salt: BytesN::from_array(&e, &[0u8; 32]),
                 }),
+                Vec::new(&e),
+                rule.clone(),
+                account.clone(),
+            );
+        });
+    }
+
+    #[test]
+    #[should_panic]
+    fn enforce_unauthorized_fails() {
+        let e = Env::default();
+        // NO mock_all_auths — enforce must fail at smart_account.require_auth().
+        let addr = e.register(MockContract, ());
+        let account = Address::generate(&e);
+        let target = Address::generate(&e);
+        let rule = make_rule(&e);
+
+        // Insert config directly — bypasses install() which calls require_auth.
+        e.as_contract(&addr, || {
+            save_config(&e, &account, rule.id, &UpgradeRuleConfig { target_contract: target.clone() });
+        });
+
+        e.as_contract(&addr, || {
+            UpgradeRulePolicy::enforce(
+                &e,
+                upgrade_ctx(&e, &target),
                 Vec::new(&e),
                 rule.clone(),
                 account.clone(),
