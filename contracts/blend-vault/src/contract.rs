@@ -58,6 +58,8 @@ pub enum BlendVaultError {
     AlreadyInitialized = 8003,
     /// Arithmetic overflow in financial calculation.
     ArithmeticError = 8004,
+    /// Deposit amount must be greater than zero.
+    ZeroAssets = 8005,
 }
 
 // ── Struct de posición del usuario ────────────────────────────────────────────
@@ -173,6 +175,10 @@ impl FungibleVault for BlendVaultContract {
         operator: Address,
     ) -> i128 {
         operator.require_auth();
+
+        if assets <= 0 {
+            panic_with_error!(e, BlendVaultError::ZeroAssets);
+        }
 
         let max = Vault::max_deposit(e, receiver.clone());
         if assets > max {

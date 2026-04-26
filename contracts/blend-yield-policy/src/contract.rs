@@ -292,6 +292,8 @@ impl BlendYieldPolicy {
     /// Guarda la wallet canónica de Accesly en instance storage.
     /// Llamado una sola vez al desplegar el contrato.
     pub fn __constructor(e: &Env, accesly_wallet: Address) {
+        // Prevents an attacker from deploying this contract with a malicious accesly_wallet.
+        accesly_wallet.require_auth();
         if e.storage().instance().has(&InstanceKey::AcceslyWallet) {
             panic_with_error!(e, BlendYieldPolicyError::AlreadyInitialized);
         }
@@ -423,6 +425,7 @@ mod tests {
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        e.mock_all_auths();
         let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
         e.mock_all_auths();
@@ -445,6 +448,7 @@ mod tests {
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        e.mock_all_auths();
         let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
 
@@ -468,6 +472,7 @@ mod tests {
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        e.mock_all_auths();
         let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
         e.mock_all_auths();
@@ -502,6 +507,7 @@ mod tests {
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        e.mock_all_auths();
         let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
 
@@ -534,6 +540,7 @@ mod tests {
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        e.mock_all_auths();
         let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
         e.mock_all_auths();
@@ -570,6 +577,7 @@ mod tests {
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        e.mock_all_auths();
         let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
         e.mock_all_auths();
@@ -597,6 +605,7 @@ mod tests {
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        e.mock_all_auths();
         let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
         e.mock_all_auths();
@@ -626,6 +635,7 @@ mod tests {
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
         let wrong_dev = Address::generate(&e); // dev incorrecto
+        e.mock_all_auths();
         let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
         e.mock_all_auths();
@@ -653,6 +663,7 @@ mod tests {
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        e.mock_all_auths();
         let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
         e.mock_all_auths();
@@ -682,6 +693,7 @@ mod tests {
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        e.mock_all_auths();
         let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
         e.mock_all_auths();
@@ -704,6 +716,7 @@ mod tests {
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        e.mock_all_auths();
         let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
 
@@ -724,6 +737,7 @@ mod tests {
         let e = Env::default();
         let vault = e.register(MockBlendVault, ());
         let accesly = Address::generate(&e);
+        e.mock_all_auths();
         let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let account = Address::generate(&e);
         let rule = make_rule(&e, &vault);
@@ -745,6 +759,7 @@ mod tests {
         let account = Address::generate(&e);
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
+        e.mock_all_auths();
         let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
         e.ledger().with_mut(|l| l.sequence_number = 1000);
@@ -764,7 +779,10 @@ mod tests {
             save_config(&e, &account, rule.id, &cfg);
         });
 
-        // Enforce without any auth mock — smart_account.require_auth() must fail.
+        // Reset auth mocks: switch from mock_all_auths to empty list — no auths approved.
+        e.mock_auths(&[]);
+
+        // Enforce without auth — smart_account.require_auth() must fail.
         e.as_contract(&policy, || {
             BlendYieldPolicy::enforce(
                 &e,
@@ -787,6 +805,7 @@ mod tests {
         let dev = Address::generate(&e);
         let accesly = Address::generate(&e);
         let wrong_accesly = Address::generate(&e); // distinta de la canónica
+        e.mock_all_auths();
         let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
         let rule = make_rule(&e, &vault);
         e.mock_all_auths();
@@ -805,12 +824,22 @@ mod tests {
     // ── constructor re-call guard ─────────────────────────────────────────────
 
     #[test]
+    #[should_panic]
+    fn constructor_requires_auth_fails() {
+        let e = Env::default();
+        let unauthorized = Address::generate(&e);
+        // NO mock_all_auths — constructor must fail at unauthorized.require_auth()
+        let _policy = e.register(BlendYieldPolicy, (unauthorized.clone(),));
+    }
+
+    #[test]
     #[should_panic(expected = "Error(Contract, #9011)")]
     fn constructor_twice_fails() {
         let e = Env::default();
         let accesly = Address::generate(&e);
         let attacker = Address::generate(&e);
         // First call happens via e.register (constructor runs at deploy time).
+        e.mock_all_auths();
         let policy = e.register(BlendYieldPolicy, (accesly.clone(),));
 
         // Second call must fail — attacker cannot overwrite canonical accesly_wallet.

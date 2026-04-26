@@ -55,6 +55,8 @@ pub enum BlendRuleError {
     InvalidArgs = 6006,
     /// El campo `from` no es el smart account que instaló la policy.
     WrongFrom = 6007,
+    /// El campo `to` (receiver) no es el smart account — previene drain de fondos.
+    WrongTo = 6008,
 }
 
 // ── Tipos de storage ──────────────────────────────────────────────────────────
@@ -154,6 +156,15 @@ impl Policy for BlendRulePolicy {
             .unwrap_or_else(|| panic_with_error!(e, BlendRuleError::InvalidArgs));
         if from != smart_account {
             panic_with_error!(e, BlendRuleError::WrongFrom);
+        }
+
+        // args[2] = to — must equal smart_account to prevent fund drain via session key
+        let to = args
+            .get(2)
+            .and_then(|v| Address::try_from_val(e, &v).ok())
+            .unwrap_or_else(|| panic_with_error!(e, BlendRuleError::InvalidArgs));
+        if to != smart_account {
+            panic_with_error!(e, BlendRuleError::WrongTo);
         }
 
         // args[3] = requests: Vec<Request>
@@ -530,6 +541,43 @@ mod tests {
                 contract: pool.clone(),
                 fn_name: symbol_short!("withdraw"),
                 args: Vec::new(&e),
+            });
+            BlendRulePolicy::enforce(&e, ctx, Vec::new(&e), rule.clone(), account.clone());
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6008)")]
+    fn enforce_wrong_to_fails() {
+        let e = Env::default();
+        let addr = e.register(MockContract, ());
+        let account = Address::generate(&e);
+        let attacker = Address::generate(&e);
+        let pool = Address::generate(&e);
+        let rule = make_rule(&e);
+        e.mock_all_auths();
+
+        e.as_contract(&addr, || {
+            BlendRulePolicy::install(&e, BlendRuleInstallParams {
+                pool: pool.clone(),
+                allowed_request_types: default_types(&e),
+                max_amount_per_request: 0,
+            }, rule.clone(), account.clone());
+        });
+
+        e.as_contract(&addr, || {
+            // Build context with to = attacker (not smart_account) — must be rejected
+            let mut args = Vec::new(&e);
+            args.push_back(account.clone().into_val(&e));   // args[0] = from = account ✓
+            args.push_back(account.clone().into_val(&e));   // args[1] = spender
+            args.push_back(attacker.clone().into_val(&e));  // args[2] = to = attacker ← wrong
+            let mut reqs = Vec::new(&e);
+            reqs.push_back(make_request(&e, REQUEST_SUPPLY, 1_000_000));
+            args.push_back(reqs.into_val(&e));
+            let ctx = Context::Contract(ContractContext {
+                contract: pool.clone(),
+                fn_name: Symbol::new(&e, "submit"),
+                args,
             });
             BlendRulePolicy::enforce(&e, ctx, Vec::new(&e), rule.clone(), account.clone());
         });

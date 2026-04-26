@@ -235,6 +235,18 @@ fn b_tokens_to_usdc_overflow_returns_none() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #8005)")]
+fn deposit_zero_panics() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (vault, pool, _, _) = setup(&e);
+    MockBlendPoolClient::new(&e, &pool).set_b_rate(&SCALAR_7);
+    MockBlendPoolClient::new(&e, &pool).set_b_tokens(&0i128);
+    let user = Address::generate(&e);
+    BlendVaultContractClient::new(&e, &vault).deposit(&0i128, &user, &user, &user);
+}
+
+#[test]
 fn redeem_burns_shares_and_reduces_principal() {
     let e = Env::default();
     e.mock_all_auths();

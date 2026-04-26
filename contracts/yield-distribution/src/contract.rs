@@ -63,6 +63,10 @@ pub enum YieldDistError {
     AmountExceeded = 7010,
     /// El destinatario no es user_wallet ni accesly_wallet — drain rechazado.
     UnauthorizedRecipient = 7011,
+    /// La cantidad a Accesly supera el ratio BPS configurado respecto a la porción de usuario.
+    BpsExceedsRatio = 7012,
+    /// Transferencia a accesly_wallet sin transferencia previa a user_wallet en este período.
+    AcceslyTransferNotPaired = 7013,
 }
 
 // ── Storage ──────────────────────────────────────────────────────────────────
@@ -91,10 +95,15 @@ pub struct YieldConfig {
     pub accesly_bps: u32,
     /// Monto máximo por transferencia individual en stroops (0 = sin límite).
     pub max_amount_per_transfer: i128,
-    /// Último ledger en que se distribuyó. 0 = nunca.
+    /// Último ledger en que se completó una distribución (leg Accesly). 0 = nunca.
     pub last_distribution: u32,
     /// Si está en false, la política rechaza cualquier distribución.
     pub enabled: bool,
+    /// Monto de la transferencia a user_wallet pendiente de ser emparejada con la de Accesly.
+    /// 0 = ninguna transferencia de usuario pendiente en este período.
+    pub pending_user_amount: i128,
+    /// Ledger de la última transferencia a user_wallet. Usado para impedir double-payout por leg.
+    pub last_user_transfer: u32,
 }
 
 // ── Parámetros de instalación ─────────────────────────────────────────────────
@@ -205,15 +214,44 @@ impl Policy for YieldDistributionPolicy {
             panic_with_error!(e, YieldDistError::AmountExceeded);
         }
 
-        // 4. El período se verifica y actualiza solo en la transferencia a accesly_wallet.
-        //    Esto permite dos transfers en la misma tx (usuario + Accesly) sin conflicto.
-        if to == cfg.accesly_wallet {
+        // 4. Control de flujo por leg:
+        //    - user_wallet: gatekeeping de double-payout; registra monto pendiente.
+        //    - accesly_wallet: require user leg primero, valida ratio BPS, verifica período.
+        if to == cfg.user_wallet {
+            let current = e.ledger().sequence();
+            // Solo una transferencia a user_wallet por período — rastreada con last_user_transfer.
+            let user_period_elapsed = cfg.last_user_transfer == 0
+                || current >= cfg.last_user_transfer.saturating_add(cfg.period_ledgers);
+            if !user_period_elapsed {
+                panic_with_error!(e, YieldDistError::PeriodNotElapsed);
+            }
+            cfg.pending_user_amount = amount;
+            cfg.last_user_transfer = current;
+            save_config(e, &smart_account, context_rule.id, &cfg);
+        } else {
+            // to == accesly_wallet (ya validado arriba con UnauthorizedRecipient)
+            // Require que la leg de usuario haya ocurrido primero en este período.
+            if cfg.pending_user_amount == 0 {
+                panic_with_error!(e, YieldDistError::AcceslyTransferNotPaired);
+            }
+            // Validar ratio BPS: amount * (10000 - bps) <= pending_user_amount * bps
+            let bps = cfg.accesly_bps as i128;
+            let complement = 10_000i128 - bps;
+            let lhs = amount.checked_mul(complement)
+                .unwrap_or_else(|| panic_with_error!(e, YieldDistError::InvalidArgs));
+            let rhs = cfg.pending_user_amount.checked_mul(bps)
+                .unwrap_or_else(|| panic_with_error!(e, YieldDistError::InvalidArgs));
+            if lhs > rhs {
+                panic_with_error!(e, YieldDistError::BpsExceedsRatio);
+            }
+            // Período mínimo entre distribuciones.
             let current = e.ledger().sequence();
             if cfg.last_distribution > 0
                 && current < cfg.last_distribution.saturating_add(cfg.period_ledgers)
             {
                 panic_with_error!(e, YieldDistError::PeriodNotElapsed);
             }
+            cfg.pending_user_amount = 0;
             cfg.last_distribution = current;
             save_config(e, &smart_account, context_rule.id, &cfg);
         }
@@ -243,6 +281,8 @@ impl Policy for YieldDistributionPolicy {
             max_amount_per_transfer: install_params.max_amount_per_transfer,
             last_distribution: 0,
             enabled: true,
+            pending_user_amount: 0,
+            last_user_transfer: 0,
         };
         save_config(e, &smart_account, context_rule.id, &cfg);
     }
@@ -513,6 +553,16 @@ mod tests {
             YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly, &user_wallet, &relayer), rule.clone(), account.clone());
         });
 
+        // User leg must come first — sets pending_user_amount.
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
+            YieldDistributionPolicy::enforce(
+                &e, transfer_ctx(&e, &cetes, &account, &user_wallet, 500_000),
+                Vec::new(&e), rule.clone(), account.clone(),
+            );
+        });
+
+        // Accesly leg: validates BPS (500_000 * 5000 <= 500_000 * 5000 ✓), updates timestamp.
         e.mock_all_auths();
         e.as_contract(&addr, || {
             YieldDistributionPolicy::enforce(
@@ -602,6 +652,14 @@ mod tests {
             YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly, &user_wallet, &relayer), rule.clone(), account.clone());
         });
 
+        // Cycle 1: user then accesly — sets last_distribution = 1000.
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
+            YieldDistributionPolicy::enforce(
+                &e, transfer_ctx(&e, &cetes, &account, &user_wallet, 500_000),
+                Vec::new(&e), rule.clone(), account.clone(),
+            );
+        });
         e.mock_all_auths();
         e.as_contract(&addr, || {
             YieldDistributionPolicy::enforce(
@@ -610,6 +668,14 @@ mod tests {
             );
         });
 
+        // Cycle 2: user leg succeeds (pending cleared); accesly leg fails — period not elapsed.
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
+            YieldDistributionPolicy::enforce(
+                &e, transfer_ctx(&e, &cetes, &account, &user_wallet, 500_000),
+                Vec::new(&e), rule.clone(), account.clone(),
+            );
+        });
         e.mock_all_auths();
         e.as_contract(&addr, || {
             YieldDistributionPolicy::enforce(
@@ -781,6 +847,8 @@ mod tests {
                 max_amount_per_transfer: 0,
                 last_distribution: 0,
                 enabled: true,
+                pending_user_amount: 0,
+                last_user_transfer: 0,
             };
             save_config(&e, &account, rule.id, &cfg);
         });
@@ -810,6 +878,14 @@ mod tests {
             YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly, &user_wallet, &relayer), rule.clone(), account.clone());
         });
 
+        // Cycle 1.
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
+            YieldDistributionPolicy::enforce(
+                &e, transfer_ctx(&e, &cetes, &account, &user_wallet, 500_000),
+                Vec::new(&e), rule.clone(), account.clone(),
+            );
+        });
         e.mock_all_auths();
         e.as_contract(&addr, || {
             YieldDistributionPolicy::enforce(
@@ -820,6 +896,14 @@ mod tests {
 
         e.ledger().with_mut(|l| l.sequence_number = 1000 + WEEK_IN_LEDGERS);
 
+        // Cycle 2 after period elapsed.
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
+            YieldDistributionPolicy::enforce(
+                &e, transfer_ctx(&e, &cetes, &account, &user_wallet, 500_000),
+                Vec::new(&e), rule.clone(), account.clone(),
+            );
+        });
         e.mock_all_auths();
         e.as_contract(&addr, || {
             YieldDistributionPolicy::enforce(
@@ -869,6 +953,14 @@ mod tests {
             YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly, &user_wallet, &relayer), rule.clone(), account.clone());
         });
 
+        // User leg first, then accesly leg sets last_distribution.
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
+            YieldDistributionPolicy::enforce(
+                &e, transfer_ctx(&e, &cetes, &account, &user_wallet, 500_000),
+                Vec::new(&e), rule.clone(), account.clone(),
+            );
+        });
         e.mock_all_auths();
         e.as_contract(&addr, || {
             YieldDistributionPolicy::enforce(
@@ -877,6 +969,109 @@ mod tests {
             );
             let remaining = YieldDistributionPolicy::ledgers_until_next(e.clone(), rule.id, account.clone());
             assert_eq!(remaining, WEEK_IN_LEDGERS);
+        });
+    }
+
+    // ── seguridad: nuevas reglas de pairing BPS y period gate ────────────────
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #7013)")]
+    fn enforce_accesly_without_user_fails() {
+        let e = Env::default();
+        let addr = e.register(MockContract, ());
+        let account = Address::generate(&e);
+        let cetes = Address::generate(&e);
+        let accesly = Address::generate(&e);
+        let user_wallet = Address::generate(&e);
+        let relayer = Address::generate(&e);
+        let rule = make_rule(&e);
+
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
+            YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly, &user_wallet, &relayer), rule.clone(), account.clone());
+        });
+
+        // Accesly transfer without prior user transfer — must fail (#7013).
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
+            YieldDistributionPolicy::enforce(
+                &e, transfer_ctx(&e, &cetes, &account, &accesly, 500_000),
+                Vec::new(&e), rule.clone(), account.clone(),
+            );
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #7003)")]
+    fn enforce_double_user_transfer_fails() {
+        let e = Env::default();
+        let addr = e.register(MockContract, ());
+        let account = Address::generate(&e);
+        let cetes = Address::generate(&e);
+        let accesly = Address::generate(&e);
+        let user_wallet = Address::generate(&e);
+        let relayer = Address::generate(&e);
+        let rule = make_rule(&e);
+        e.ledger().with_mut(|l| l.sequence_number = 1000);
+
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
+            YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly, &user_wallet, &relayer), rule.clone(), account.clone());
+        });
+
+        // First user transfer — OK.
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
+            YieldDistributionPolicy::enforce(
+                &e, transfer_ctx(&e, &cetes, &account, &user_wallet, 500_000),
+                Vec::new(&e), rule.clone(), account.clone(),
+            );
+        });
+
+        // Second user transfer in same period — must fail (#7003).
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
+            YieldDistributionPolicy::enforce(
+                &e, transfer_ctx(&e, &cetes, &account, &user_wallet, 500_000),
+                Vec::new(&e), rule.clone(), account.clone(),
+            );
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #7012)")]
+    fn enforce_bps_exceeded_fails() {
+        let e = Env::default();
+        let addr = e.register(MockContract, ());
+        let account = Address::generate(&e);
+        let cetes = Address::generate(&e);
+        let accesly = Address::generate(&e);
+        let user_wallet = Address::generate(&e);
+        let relayer = Address::generate(&e);
+        let rule = make_rule(&e);
+
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
+            // accesly_bps = 5000 (50%) → accesly can get at most user_amount
+            YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly, &user_wallet, &relayer), rule.clone(), account.clone());
+        });
+
+        // User gets 100 → accesly can get at most 100 with bps=5000.
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
+            YieldDistributionPolicy::enforce(
+                &e, transfer_ctx(&e, &cetes, &account, &user_wallet, 100),
+                Vec::new(&e), rule.clone(), account.clone(),
+            );
+        });
+
+        // Accesly tries to get 101 > 100 — must fail (#7012).
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
+            YieldDistributionPolicy::enforce(
+                &e, transfer_ctx(&e, &cetes, &account, &accesly, 101),
+                Vec::new(&e), rule.clone(), account.clone(),
+            );
         });
     }
 
@@ -907,6 +1102,8 @@ mod tests {
                 max_amount_per_transfer: 0,
                 last_distribution: 0,
                 enabled: true,
+                pending_user_amount: 0,
+                last_user_transfer: 0,
             };
             save_config(&e, &account, rule.id, &cfg);
         });

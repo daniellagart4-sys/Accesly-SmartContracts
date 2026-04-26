@@ -63,13 +63,18 @@ pub fn get_accesly_wallet(e: &Env) -> Address {
 // ── Principal por usuario ─────────────────────────────────────────────────────
 
 /// Añade `amount` USDC al principal del usuario (al depositar).
+/// Si el resultado es 0, elimina la clave en lugar de persistir un valor nulo.
 pub fn add_principal(e: &Env, user: &Address, amount: i128) {
     let key = StorageKey::UserPrincipal(user.clone());
     let current: i128 = e.storage().persistent().get(&key).unwrap_or(0);
     let new_val = current.checked_add(amount)
         .unwrap_or_else(|| panic_with_error!(e, StorageError::PrincipalOverflow));
-    e.storage().persistent().set(&key, &new_val);
-    e.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, EXTEND_AMOUNT);
+    if new_val == 0 {
+        e.storage().persistent().remove(&key);
+    } else {
+        e.storage().persistent().set(&key, &new_val);
+        e.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, EXTEND_AMOUNT);
+    }
 }
 
 /// Reduce el principal del usuario proporcionalmente a las shares retiradas.
