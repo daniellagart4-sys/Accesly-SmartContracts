@@ -102,6 +102,14 @@ fn load_session(e: &Env, smart_account: &Address, context_rule_id: u32) -> Sessi
     }
 }
 
+fn load_session_no_extend(e: &Env, smart_account: &Address, context_rule_id: u32) -> SessionData {
+    let key = storage_key(smart_account, context_rule_id);
+    match e.storage().persistent().get::<StorageKey, SessionData>(&key) {
+        Some(data) => data,
+        None => panic_with_error!(e, SessionKeyError::NotInstalled),
+    }
+}
+
 fn save_session(e: &Env, smart_account: &Address, context_rule_id: u32, data: &SessionData) {
     let key = storage_key(smart_account, context_rule_id);
     e.storage().persistent().set(&key, data);
@@ -240,7 +248,7 @@ impl SessionKeyPolicy {
         context_rule_id: u32,
         smart_account: Address,
     ) -> SessionData {
-        load_session(&e, &smart_account, context_rule_id)
+        load_session_no_extend(&e, &smart_account, context_rule_id)
     }
 
     /// Comprueba si la sesión sigue activa.

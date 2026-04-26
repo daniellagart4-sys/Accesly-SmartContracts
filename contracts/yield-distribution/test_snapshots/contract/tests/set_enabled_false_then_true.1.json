@@ -127,7 +127,23 @@
                   },
                   {
                     "key": {
+                      "symbol": "last_user_transfer"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "max_amount_per_transfer"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "pending_user_amount"
                     },
                     "val": {
                       "i128": "0"

@@ -67,6 +67,10 @@ pub enum YieldDistError {
     BpsExceedsRatio = 7012,
     /// Transferencia a accesly_wallet sin transferencia previa a user_wallet en este período.
     AcceslyTransferNotPaired = 7013,
+    /// `period_ledgers` es cero — se requiere al menos 1 ledger entre distribuciones.
+    InvalidPeriod = 7014,
+    /// `max_amount_per_transfer` o `amount` es negativo — se requiere >= 0 en install, > 0 en enforce.
+    InvalidAmount = 7015,
 }
 
 // ── Storage ──────────────────────────────────────────────────────────────────
@@ -210,6 +214,10 @@ impl Policy for YieldDistributionPolicy {
             .and_then(|v| i128::try_from_val(e, &v).ok())
             .unwrap_or_else(|| panic_with_error!(e, YieldDistError::InvalidArgs));
 
+        if amount <= 0 {
+            panic_with_error!(e, YieldDistError::InvalidAmount);
+        }
+
         if cfg.max_amount_per_transfer > 0 && amount > cfg.max_amount_per_transfer {
             panic_with_error!(e, YieldDistError::AmountExceeded);
         }
@@ -270,6 +278,12 @@ impl Policy for YieldDistributionPolicy {
         }
         if install_params.accesly_bps > MAX_ACCESLY_BPS {
             panic_with_error!(e, YieldDistError::BpsExceedsMax);
+        }
+        if install_params.period_ledgers == 0 {
+            panic_with_error!(e, YieldDistError::InvalidPeriod);
+        }
+        if install_params.max_amount_per_transfer < 0 {
+            panic_with_error!(e, YieldDistError::InvalidAmount);
         }
         let cfg = YieldConfig {
             cetes_contract: install_params.cetes_contract,
@@ -440,6 +454,46 @@ mod tests {
         e.mock_all_auths();
         e.as_contract(&addr, || {
             YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly, &user_wallet, &relayer), rule.clone(), account.clone());
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #7014)")]
+    fn install_zero_period_fails() {
+        let e = Env::default();
+        let addr = e.register(MockContract, ());
+        let account = Address::generate(&e);
+        let cetes = Address::generate(&e);
+        let accesly = Address::generate(&e);
+        let user_wallet = Address::generate(&e);
+        let relayer = Address::generate(&e);
+        let rule = make_rule(&e);
+        e.mock_all_auths();
+
+        e.as_contract(&addr, || {
+            let mut params = make_params(&e, &cetes, &accesly, &user_wallet, &relayer);
+            params.period_ledgers = 0;
+            YieldDistributionPolicy::install(&e, params, rule.clone(), account.clone());
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #7015)")]
+    fn install_negative_max_amount_fails() {
+        let e = Env::default();
+        let addr = e.register(MockContract, ());
+        let account = Address::generate(&e);
+        let cetes = Address::generate(&e);
+        let accesly = Address::generate(&e);
+        let user_wallet = Address::generate(&e);
+        let relayer = Address::generate(&e);
+        let rule = make_rule(&e);
+        e.mock_all_auths();
+
+        e.as_contract(&addr, || {
+            let mut params = make_params(&e, &cetes, &accesly, &user_wallet, &relayer);
+            params.max_amount_per_transfer = -1;
+            YieldDistributionPolicy::install(&e, params, rule.clone(), account.clone());
         });
     }
 
@@ -790,6 +844,58 @@ mod tests {
         e.as_contract(&addr, || {
             YieldDistributionPolicy::enforce(
                 &e, transfer_ctx(&e, &cetes, &account, &accesly, 200_000),
+                Vec::new(&e), rule.clone(), account.clone(),
+            );
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #7015)")]
+    fn enforce_negative_amount_fails() {
+        let e = Env::default();
+        let addr = e.register(MockContract, ());
+        let account = Address::generate(&e);
+        let cetes = Address::generate(&e);
+        let accesly = Address::generate(&e);
+        let user_wallet = Address::generate(&e);
+        let relayer = Address::generate(&e);
+        let rule = make_rule(&e);
+
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
+            YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly, &user_wallet, &relayer), rule.clone(), account.clone());
+        });
+
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
+            YieldDistributionPolicy::enforce(
+                &e, transfer_ctx(&e, &cetes, &account, &user_wallet, -1),
+                Vec::new(&e), rule.clone(), account.clone(),
+            );
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #7015)")]
+    fn enforce_zero_amount_fails() {
+        let e = Env::default();
+        let addr = e.register(MockContract, ());
+        let account = Address::generate(&e);
+        let cetes = Address::generate(&e);
+        let accesly = Address::generate(&e);
+        let user_wallet = Address::generate(&e);
+        let relayer = Address::generate(&e);
+        let rule = make_rule(&e);
+
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
+            YieldDistributionPolicy::install(&e, make_params(&e, &cetes, &accesly, &user_wallet, &relayer), rule.clone(), account.clone());
+        });
+
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
+            YieldDistributionPolicy::enforce(
+                &e, transfer_ctx(&e, &cetes, &account, &user_wallet, 0),
                 Vec::new(&e), rule.clone(), account.clone(),
             );
         });

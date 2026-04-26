@@ -59,10 +59,7 @@ enum StorageKey {
 fn load_config(e: &Env, smart_account: &Address, rule_id: u32) -> UpgradeRuleConfig {
     let key = StorageKey::Config(smart_account.clone(), rule_id);
     match e.storage().persistent().get::<StorageKey, UpgradeRuleConfig>(&key) {
-        Some(cfg) => {
-            e.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, EXTEND_AMOUNT);
-            cfg
-        }
+        Some(cfg) => cfg,
         None => panic_with_error!(e, UpgradeRuleError::NotInstalled),
     }
 }

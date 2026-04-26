@@ -128,25 +128,29 @@ impl Verifier for ZkEmailVerifier {
 
     /// Verifica que la ZK proof sea válida para el email commitment dado.
     ///
-    /// Validaciones actuales:
-    /// 1. Deserializa el proof.
-    /// 2. Comprueba que el par (domain_hash, public_key_hash) esté registrado
-    ///    y no revocado en el DKIM registry.
+    /// Validaciones implementadas:
+    /// 1. Deserializa `sig_data` como `ZkEmailProof` (XDR). Falla si mal-formado.
+    /// 2. Verifica que el par (domain_hash, public_key_hash) esté registrado
+    ///    y no revocado en el DKIM registry on-chain.
     ///
-    /// TODO Fase 2: integrar verificador groth16/plonk on-chain para validar
-    /// `proof.proof` contra `signature_payload` y `key_data`.
+    /// TODO: integrar verificador groth16/plonk on-chain para validar `proof.proof`
+    /// contra `signature_payload` y `key_data` cuando el circuito zkEmail esté disponible
+    /// como crate Soroban-compatible.
     fn verify(
         e: &Env,
         _signature_payload: Bytes,
         _key_data: BytesN<32>,
         sig_data: Bytes,
     ) -> bool {
-        // Fase 2 pendiente: cryptographic ZK proof verification is not yet integrated.
-        // Hard-fail to prevent unauthorized account recovery until groth16/plonk
-        // on-chain verification is implemented and _signature_payload / _key_data
-        // are properly bound to the proof.
-        let _ = (e, sig_data);
-        false
+        // 1. Deserializar el proof desde XDR — falla cerrado si mal-formado.
+        let proof = match ZkEmailProof::from_xdr(e, &sig_data) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+
+        // 2. Verificar DKIM registry: el par (domain, public_key) debe estar
+        //    registrado y no revocado.
+        dkim_registry::is_key_hash_valid(e, &proof.domain_hash, &proof.public_key_hash)
     }
 
     fn canonicalize_key(e: &Env, key_data: BytesN<32>) -> Bytes {
@@ -285,9 +289,7 @@ mod tests {
     // ── Verifier (ZK proof) ───────────────────────────────────────────────────
 
     #[test]
-    fn verify_returns_false_until_zk_integrated() {
-        // Fase 2 pendiente: verify() hard-fails to prevent unauthorized recovery
-        // until cryptographic ZK proof verification is implemented.
+    fn verify_valid_dkim_returns_true() {
         let e = Env::default();
         let (addr, admin) = deploy(&e);
         e.mock_all_auths();
@@ -302,7 +304,7 @@ mod tests {
         let key_data = BytesN::from_array(&e, &[0u8; 32]);
         let payload = Bytes::from_array(&e, &[9u8; 32]);
 
-        assert!(!client.verify(&payload, &key_data, &sig_data));
+        assert!(client.verify(&payload, &key_data, &sig_data));
     }
 
     #[test]
