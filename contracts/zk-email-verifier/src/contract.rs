@@ -128,29 +128,23 @@ impl Verifier for ZkEmailVerifier {
 
     /// Verifica que la ZK proof sea válida para el email commitment dado.
     ///
-    /// Validaciones implementadas:
-    /// 1. Deserializa `sig_data` como `ZkEmailProof` (XDR). Falla si mal-formado.
-    /// 2. Verifica que el par (domain_hash, public_key_hash) esté registrado
-    ///    y no revocado en el DKIM registry on-chain.
-    ///
-    /// TODO: integrar verificador groth16/plonk on-chain para validar `proof.proof`
-    /// contra `signature_payload` y `key_data` cuando el circuito zkEmail esté disponible
-    /// como crate Soroban-compatible.
+    /// Fase 2 pendiente: hard-fail intencional.
+    /// La verificación DKIM-only (sin binding a key_data ni a signature_payload)
+    /// permite que cualquier par (domain, pk_hash) registrado pase auth,
+    /// independientemente de a qué cuenta apunta el proof. La solución completa
+    /// requiere el verificador groth16/plonk generado por el circuito zkEmail
+    /// de Accesly (back-end), que valide proof.proof contra key_data y
+    /// signature_payload antes de delegar a este contrato.
     fn verify(
         e: &Env,
         _signature_payload: Bytes,
         _key_data: BytesN<32>,
         sig_data: Bytes,
     ) -> bool {
-        // 1. Deserializar el proof desde XDR — falla cerrado si mal-formado.
-        let proof = match ZkEmailProof::from_xdr(e, &sig_data) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-
-        // 2. Verificar DKIM registry: el par (domain, public_key) debe estar
-        //    registrado y no revocado.
-        dkim_registry::is_key_hash_valid(e, &proof.domain_hash, &proof.public_key_hash)
+        // Hard-fail: sin verificación criptográfica del proof no hay seguridad real.
+        // Fase 2 integra el verificador groth16/plonk via back-end Accesly.
+        let _ = (e, sig_data);
+        false
     }
 
     fn canonicalize_key(e: &Env, key_data: BytesN<32>) -> Bytes {
@@ -289,7 +283,9 @@ mod tests {
     // ── Verifier (ZK proof) ───────────────────────────────────────────────────
 
     #[test]
-    fn verify_valid_dkim_returns_true() {
+    fn verify_returns_false_until_zk_integrated() {
+        // Hard-fail intencional: sin binding a key_data ni proof criptográfico,
+        // la verificación DKIM-only es bypasseable. Fase 2 integra groth16/plonk.
         let e = Env::default();
         let (addr, admin) = deploy(&e);
         e.mock_all_auths();
@@ -304,7 +300,7 @@ mod tests {
         let key_data = BytesN::from_array(&e, &[0u8; 32]);
         let payload = Bytes::from_array(&e, &[9u8; 32]);
 
-        assert!(client.verify(&payload, &key_data, &sig_data));
+        assert!(!client.verify(&payload, &key_data, &sig_data));
     }
 
     #[test]

@@ -34,7 +34,7 @@
 //! operaciones `change_trust` en la misma transacción de deploy.
 use soroban_sdk::{
     auth::{Context, CustomAccountInterface},
-    contract, contractimpl,
+    contract, contractimpl, contracterror, contracttype, panic_with_error,
     crypto::Hash,
     Address, BytesN, Env, Map, String, Symbol, Val, Vec,
 };
@@ -46,6 +46,20 @@ use stellar_contract_utils::upgradeable::{self as upgradeable_lib, Upgradeable};
 
 use crate::context_rules::setup_context_rules;
 use crate::trustlines::{emit_trustlines_required, StellarAsset};
+
+// ── Errores y storage del contrato ───────────────────────────────────────────
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[repr(u32)]
+enum SmartAccountContractError {
+    AlreadyInitialized = 9001,
+}
+
+#[contracttype]
+enum SmartAccountStorageKey {
+    Initialized,
+}
 
 // ── Contrato ──────────────────────────────────────────────────────────────────
 
@@ -96,6 +110,11 @@ impl AcceslySmartAccount {
         cetes_contract: Address,
         trusted_assets: Vec<StellarAsset>,
     ) {
+        if e.storage().instance().has(&SmartAccountStorageKey::Initialized) {
+            panic_with_error!(e, SmartAccountContractError::AlreadyInitialized);
+        }
+        e.storage().instance().set(&SmartAccountStorageKey::Initialized, &true);
+
         // Nota: email_commitment y secp256r1_pubkey se pasan a setup_context_rules
         // para que los signers tengan los key_data reales desde el primer momento.
         setup_context_rules(

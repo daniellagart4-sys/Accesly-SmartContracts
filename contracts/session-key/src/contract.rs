@@ -47,10 +47,12 @@ pub enum SessionKeyError {
     AlreadyInstalled = 5003,
     /// Llamada no-transfer rechazada cuando hay límite de monto activo.
     NonTransferNotAllowed = 5004,
-    /// Monto de transferencia negativo o cero — rechazado para evitar bypass del cap.
-    InvalidAmount = 5006,
     /// La duración de la sesión supera el máximo permitido (30 días).
     SessionTooLong = 5005,
+    /// Monto de transferencia negativo o cero — rechazado para evitar bypass del cap.
+    InvalidAmount = 5006,
+    /// approve() y transfer_from() están siempre prohibidos — crean allowances persistentes.
+    ApproveForbidden = 5007,
 }
 
 // ── Storage ──────────────────────────────────────────────────────────────────
@@ -94,10 +96,7 @@ fn storage_key(smart_account: &Address, context_rule_id: u32) -> StorageKey {
 fn load_session(e: &Env, smart_account: &Address, context_rule_id: u32) -> SessionData {
     let key = storage_key(smart_account, context_rule_id);
     match e.storage().persistent().get::<StorageKey, SessionData>(&key) {
-        Some(data) => {
-            e.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, EXTEND_AMOUNT);
-            data
-        }
+        Some(data) => data,
         None => panic_with_error!(e, SessionKeyError::NotInstalled),
     }
 }
@@ -122,6 +121,16 @@ fn remove_session(e: &Env, smart_account: &Address, context_rule_id: u32) {
 }
 
 // ── Extrae el monto de una transferencia de token (SEP-41) ────────────────────
+
+/// Devuelve true si el contexto es `approve()` o `transfer_from()` — funciones que
+/// crean allowances persistentes y están prohibidas en toda session key.
+fn is_allowance_call(e: &Env, context: &Context) -> bool {
+    if let Context::Contract(ContractContext { fn_name, .. }) = context {
+        fn_name == &Symbol::new(e, "approve") || fn_name == &Symbol::new(e, "transfer_from")
+    } else {
+        false
+    }
+}
 
 /// Intenta obtener el monto de una llamada `transfer(from, to, amount)`.
 /// Devuelve None si el contexto no es una transferencia estándar.
@@ -157,6 +166,12 @@ impl Policy for SessionKeyPolicy {
     ) {
         // Bind enforce to the SA's auth flow — prevents direct external calls.
         smart_account.require_auth();
+
+        // approve() y transfer_from() crean allowances persistentes más allá del
+        // lifetime de la sesión — prohibidos siempre, independiente de max_amount.
+        if is_allowance_call(e, &context) {
+            panic_with_error!(e, SessionKeyError::ApproveForbidden);
+        }
 
         let mut data = load_session(e, &smart_account, context_rule.id);
 
@@ -242,12 +257,14 @@ impl SessionKeyPolicy {
         save_session(&e, &smart_account, context_rule_id, &data);
     }
 
-    /// Consulta el estado de la sesión.
+    /// Consulta el estado de la sesión. Requiere auth del Smart Account.
+    /// Para saber si una sesión está activa sin auth, usar `is_active()`.
     pub fn get_session(
         e: Env,
         context_rule_id: u32,
         smart_account: Address,
     ) -> SessionData {
+        smart_account.require_auth();
         load_session_no_extend(&e, &smart_account, context_rule_id)
     }
 
@@ -272,7 +289,7 @@ mod tests {
         auth::{Context, ContractContext},
         contract, symbol_short,
         testutils::{Address as _, Ledger},
-        Address, Env, IntoVal, String, Vec,
+        Address, Env, IntoVal, String, Symbol, Vec,
     };
     use stellar_accounts::smart_account::{ContextRule, ContextRuleType, Signer};
 
@@ -309,7 +326,23 @@ mod tests {
     fn non_transfer_ctx(e: &Env) -> Context {
         Context::Contract(ContractContext {
             contract: Address::generate(e),
-            fn_name: symbol_short!("approve"),
+            fn_name: symbol_short!("swap"),
+            args: soroban_sdk::Vec::new(e),
+        })
+    }
+
+    fn approve_ctx(e: &Env) -> Context {
+        Context::Contract(ContractContext {
+            contract: Address::generate(e),
+            fn_name: Symbol::new(e, "approve"),
+            args: soroban_sdk::Vec::new(e),
+        })
+    }
+
+    fn transfer_from_ctx(e: &Env) -> Context {
+        Context::Contract(ContractContext {
+            contract: Address::generate(e),
+            fn_name: Symbol::new(e, "transfer_from"),
             args: soroban_sdk::Vec::new(e),
         })
     }
@@ -322,11 +355,15 @@ mod tests {
         let addr = e.register(MockContract, ());
         let account = Address::generate(&e);
         let rule = make_rule(&e);
-        e.mock_all_auths();
 
+        e.mock_all_auths();
         e.as_contract(&addr, || {
             let params = SessionKeyInstallParams { expires_at: 1000, max_amount: 500_000 };
             SessionKeyPolicy::install(&e, params, rule.clone(), account.clone());
+        });
+
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
             let data = SessionKeyPolicy::get_session(e.clone(), rule.id, account.clone());
             assert_eq!(data.expires_at, 1000);
             assert_eq!(data.max_amount, 500_000);
@@ -515,6 +552,10 @@ mod tests {
             SessionKeyPolicy::enforce(
                 &e, transfer_ctx(&e, 400_000), Vec::new(&e), rule.clone(), account.clone(),
             );
+        });
+
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
             let data = SessionKeyPolicy::get_session(e.clone(), rule.id, account.clone());
             assert_eq!(data.spent, 800_000);
         });
@@ -698,11 +739,62 @@ mod tests {
             SessionKeyPolicy::enforce(
                 &e, transfer_ctx(&e, 400_000), Vec::new(&e), rule.clone(), acct1.clone(),
             );
+        });
 
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
             let d1 = SessionKeyPolicy::get_session(e.clone(), rule.id, acct1.clone());
             let d2 = SessionKeyPolicy::get_session(e.clone(), rule.id, acct2.clone());
             assert_eq!(d1.spent, 400_000);
             assert_eq!(d2.spent, 0); // acct2 no tocada
+        });
+    }
+
+    // ── seguridad: approve y transfer_from siempre prohibidos ────────────────
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5007)")]
+    fn enforce_approve_always_forbidden() {
+        let e = Env::default();
+        let addr = e.register(MockContract, ());
+        let account = Address::generate(&e);
+        let rule = make_rule(&e);
+        e.mock_all_auths();
+        e.ledger().with_mut(|l| l.sequence_number = 100);
+
+        e.as_contract(&addr, || {
+            let params = SessionKeyInstallParams { expires_at: 500, max_amount: 0 };
+            SessionKeyPolicy::install(&e, params, rule.clone(), account.clone());
+        });
+
+        e.as_contract(&addr, || {
+            // approve() crea allowances persistentes — siempre prohibido.
+            SessionKeyPolicy::enforce(
+                &e, approve_ctx(&e), Vec::new(&e), rule.clone(), account.clone(),
+            );
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5007)")]
+    fn enforce_transfer_from_always_forbidden() {
+        let e = Env::default();
+        let addr = e.register(MockContract, ());
+        let account = Address::generate(&e);
+        let rule = make_rule(&e);
+        e.mock_all_auths();
+        e.ledger().with_mut(|l| l.sequence_number = 100);
+
+        e.as_contract(&addr, || {
+            let params = SessionKeyInstallParams { expires_at: 500, max_amount: 1_000_000 };
+            SessionKeyPolicy::install(&e, params, rule.clone(), account.clone());
+        });
+
+        e.as_contract(&addr, || {
+            // transfer_from() consume allowances preexistentes — siempre prohibido.
+            SessionKeyPolicy::enforce(
+                &e, transfer_from_ctx(&e), Vec::new(&e), rule.clone(), account.clone(),
+            );
         });
     }
 
@@ -744,6 +836,10 @@ mod tests {
                 max_amount: 0,
             };
             SessionKeyPolicy::install(&e, params, rule.clone(), account.clone());
+        });
+
+        e.mock_all_auths();
+        e.as_contract(&addr, || {
             let data = SessionKeyPolicy::get_session(e.clone(), rule.id, account.clone());
             assert_eq!(data.expires_at, 100 + MAX_SESSION_DURATION);
         });
